@@ -27,6 +27,7 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <string.h>
 
+#include "gstgdkpixbufelements.h"
 #include "gstgdkpixbufdec.h"
 
 GST_DEBUG_CATEGORY_STATIC (gdkpixbufdec_debug);
@@ -74,6 +75,9 @@ static gboolean gst_gdk_pixbuf_dec_sink_event (GstPad * pad, GstObject * parent,
 
 #define gst_gdk_pixbuf_dec_parent_class parent_class
 G_DEFINE_TYPE (GstGdkPixbufDec, gst_gdk_pixbuf_dec, GST_TYPE_ELEMENT);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (gdkpixbufdec, "gdkpixbufdec",
+    GST_RANK_SECONDARY, GST_TYPE_GDK_PIXBUF_DEC,
+    gdk_pixbuf_element_init (plugin));
 
 static gboolean
 gst_gdk_pixbuf_dec_sink_setcaps (GstGdkPixbufDec * filter, GstCaps * caps)
@@ -370,7 +374,8 @@ gst_gdk_pixbuf_dec_flush (GstGdkPixbufDec * filter)
   /* ERRORS */
 no_pixbuf:
   {
-    GST_ELEMENT_ERROR (filter, STREAM, DECODE, (NULL), ("error geting pixbuf"));
+    GST_ELEMENT_ERROR (filter, STREAM, DECODE, (NULL),
+        ("error getting pixbuf"));
     return GST_FLOW_ERROR;
   }
 channels_not_supported:
@@ -431,11 +436,23 @@ gst_gdk_pixbuf_dec_sink_event (GstPad * pad, GstObject * parent,
     case GST_EVENT_SEGMENT:
     {
       const GstSegment *segment;
+      GstSegment output_segment;
+      guint32 seqnum;
+
       gst_event_parse_segment (event, &segment);
       if (segment->format == GST_FORMAT_BYTES)
         pixbuf->packetized = FALSE;
       else
         pixbuf->packetized = TRUE;
+
+      if (segment->format != GST_FORMAT_TIME) {
+        seqnum = gst_event_get_seqnum (event);
+        gst_event_unref (event);
+        gst_segment_init (&output_segment, GST_FORMAT_TIME);
+        event = gst_event_new_segment (&output_segment);
+        gst_event_set_seqnum (event, seqnum);
+      }
+
       if (pixbuf->pixbuf_loader != NULL) {
         gdk_pixbuf_loader_close (pixbuf->pixbuf_loader, NULL);
         g_object_unref (G_OBJECT (pixbuf->pixbuf_loader));

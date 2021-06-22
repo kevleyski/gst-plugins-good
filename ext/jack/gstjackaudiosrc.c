@@ -42,34 +42,34 @@
 
 /**
  * SECTION:element-jackaudiosrc
+ * @title: jackaudiosrc
  * @see_also: #GstAudioBaseSrc, #GstAudioRingBuffer
  *
  * A Src that inputs data from Jack ports.
- * 
- * It will create N Jack ports named in_&lt;name&gt;_&lt;num&gt; where 
+ *
+ * It will create N Jack ports named in_&lt;name&gt;_&lt;num&gt; where
  * &lt;name&gt; is the element name and &lt;num&gt; is starting from 1.
  * Each port corresponds to a gstreamer channel.
- * 
+ *
  * The samplerate as exposed on the caps is always the same as the samplerate of
  * the jack server.
- * 
+ *
  * When the #GstJackAudioSrc:connect property is set to auto, this element
- * will try to connect each input port to a random physical jack output pin. 
- * 
+ * will try to connect each input port to a random physical jack output pin.
+ *
  * When the #GstJackAudioSrc:connect property is set to none, the element will
  * accept any number of output channels and will create (but not connect) an
  * input port for each channel.
- * 
+ *
  * The element will generate an error when the Jack server is shut down when it
  * was PAUSED or PLAYING. This element does not support dynamic rate and buffer
  * size changes at runtime.
- * 
- * <refsect2>
- * <title>Example launch line</title>
+ *
+ * ## Example launch line
  * |[
  * gst-launch-1.0 jackaudiosrc connect=0 ! jackaudiosink connect=0
  * ]| Get audio input into gstreamer from jack.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -151,7 +151,7 @@ gst_jack_audio_src_free_channels (GstJackAudioSrc * src)
 static GType
 gst_jack_ring_buffer_get_type (void)
 {
-  static volatile gsize ringbuffer_type = 0;
+  static gsize ringbuffer_type = 0;
 
   if (g_once_init_enter (&ringbuffer_type)) {
     static const GTypeInfo ringbuffer_info = { sizeof (GstJackRingBufferClass),
@@ -502,7 +502,7 @@ gst_jack_ring_buffer_acquire (GstAudioRingBuffer * buf,
       if (res != 0 && res != EEXIST)
         goto cannot_connect;
     }
-    free (ports);
+    jack_free (ports);
   }
 done:
 
@@ -537,7 +537,7 @@ cannot_connect:
     GST_ELEMENT_ERROR (src, RESOURCE, SETTINGS, (NULL),
         ("Could not connect input ports to physical ports (%d:%s)",
             res, g_strerror (res)));
-    free (ports);
+    jack_free (ports);
     return FALSE;
   }
 }
@@ -715,6 +715,8 @@ static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
 
 #define gst_jack_audio_src_parent_class parent_class
 G_DEFINE_TYPE (GstJackAudioSrc, gst_jack_audio_src, GST_TYPE_AUDIO_BASE_SRC);
+GST_ELEMENT_REGISTER_DEFINE (jackaudiosrc, "jackaudiosrc",
+    GST_RANK_PRIMARY, GST_TYPE_JACK_AUDIO_SRC);
 
 static void gst_jack_audio_src_dispose (GObject * object);
 static void gst_jack_audio_src_set_property (GObject * object, guint prop_id,

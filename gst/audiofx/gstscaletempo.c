@@ -20,6 +20,7 @@
 
 /**
  * SECTION:element-scaletempo
+ * @title: scaletempo
  *
  * Scale tempo while maintaining pitch
  * (WSOLA-like technique with cross correlation)
@@ -27,9 +28,8 @@
  *
  * Use Sceletempo to apply playback rates without the chipmunk effect.
  *
- * <refsect2>
- * <title>Example pipelines</title>
- * <para>
+ * ## Example pipelines
+ *
  * |[
  * filesrc location=media.ext ! decodebin name=d \
  *     d. ! queue ! audioconvert ! audioresample ! scaletempo ! audioconvert ! audioresample ! autoaudiosink \
@@ -53,9 +53,8 @@
  * for the best overlap position.  Scaletempo uses a statistical cross
  * correlation (roughly a dot-product).  Scaletempo consumes most of its CPU
  * cycles here. One can use the #GstScaletempo:search propery to tune how far
- * the algoritm looks.
- * </para>
- * </refsect2>
+ * the algorithm looks.
+ *
  */
 
 /*
@@ -93,9 +92,9 @@ enum
 
 #define SUPPORTED_CAPS \
 GST_STATIC_CAPS ( \
-    GST_AUDIO_CAPS_MAKE (GST_AUDIO_NE (F32)) "; " \
-    GST_AUDIO_CAPS_MAKE (GST_AUDIO_NE (F64)) "; " \
-    GST_AUDIO_CAPS_MAKE (GST_AUDIO_NE (S16)) \
+    GST_AUDIO_CAPS_MAKE (GST_AUDIO_NE (F32)) ", layout=(string)interleaved; " \
+    GST_AUDIO_CAPS_MAKE (GST_AUDIO_NE (F64)) ", layout=(string)interleaved; " \
+    GST_AUDIO_CAPS_MAKE (GST_AUDIO_NE (S16)) ", layout=(string)interleaved" \
 )
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
@@ -113,6 +112,8 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
 #define gst_scaletempo_parent_class parent_class
 G_DEFINE_TYPE_WITH_CODE (GstScaletempo, gst_scaletempo,
     GST_TYPE_BASE_TRANSFORM, DEBUG_INIT (0));
+GST_ELEMENT_REGISTER_DEFINE (scaletempo, "scaletempo",
+    GST_RANK_NONE, GST_TYPE_SCALETEMPO);
 
 #define CREATE_BEST_OVERLAP_OFFSET_FLOAT_FUNC(type) \
 static guint \
@@ -748,6 +749,27 @@ gst_scaletempo_query (GstBaseTransform * trans, GstPadDirection direction,
 
   if (direction == GST_PAD_SRC) {
     switch (GST_QUERY_TYPE (query)) {
+      case GST_QUERY_SEGMENT:
+      {
+        GstFormat format;
+        gint64 start, stop;
+
+        format = scaletempo->out_segment.format;
+
+        start =
+            gst_segment_to_stream_time (&scaletempo->out_segment, format,
+            scaletempo->out_segment.start);
+        if ((stop = scaletempo->out_segment.stop) == -1)
+          stop = scaletempo->out_segment.duration;
+        else
+          stop =
+              gst_segment_to_stream_time (&scaletempo->out_segment, format,
+              stop);
+
+        gst_query_set_segment (query, scaletempo->out_segment.rate, format,
+            start, stop);
+        return TRUE;
+      }
       case GST_QUERY_LATENCY:{
         GstPad *peer;
 
@@ -885,7 +907,7 @@ gst_scaletempo_class_init (GstScaletempoClass * klass)
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
   gst_element_class_add_static_pad_template (gstelement_class, &sink_template);
   gst_element_class_set_static_metadata (gstelement_class, "Scaletempo",
-      "Filter/Effect/Rate",
+      "Filter/Effect/Rate/Audio",
       "Sync audio tempo with playback rate",
       "Rov Juvano <rovjuvano@users.sourceforge.net>");
 

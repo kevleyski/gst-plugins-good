@@ -21,17 +21,17 @@
 
 /**
  * SECTION:element-pulsesrc
+ * @title: pulsesrc
  * @see_also: pulsesink
  *
  * This element captures audio from a
- * <ulink href="http://www.pulseaudio.org">PulseAudio sound server</ulink>.
+ * [PulseAudio sound server](http://www.pulseaudio.org).
  *
- * <refsect2>
- * <title>Example pipelines</title>
+ * ## Example pipelines
  * |[
  * gst-launch-1.0 -v pulsesrc ! audioconvert ! vorbisenc ! oggmux ! filesink location=alsasrc.ogg
  * ]| Record from a sound card using pulseaudio and encode to Ogg/Vorbis.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -45,6 +45,7 @@
 #include <gst/gsttaglist.h>
 #include <gst/audio/audio.h>
 
+#include "gstpulseelements.h"
 #include "pulsesrc.h"
 #include "pulseutil.h"
 
@@ -112,15 +113,11 @@ static GstStateChangeReturn gst_pulsesrc_change_state (GstElement *
 
 static GstClockTime gst_pulsesrc_get_time (GstClock * clock, GstPulseSrc * src);
 
-static GstStaticPadTemplate pad_template = GST_STATIC_PAD_TEMPLATE ("src",
-    GST_PAD_SRC,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (_PULSE_CAPS_PCM)
-    );
-
 #define gst_pulsesrc_parent_class parent_class
 G_DEFINE_TYPE_WITH_CODE (GstPulseSrc, gst_pulsesrc, GST_TYPE_AUDIO_SRC,
     G_IMPLEMENT_INTERFACE (GST_TYPE_STREAM_VOLUME, NULL));
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (pulsesrc, "pulsesrc",
+    GST_RANK_PRIMARY + 10, GST_TYPE_PULSESRC, pulse_element_init (plugin));
 
 static void
 gst_pulsesrc_class_init (GstPulseSrcClass * klass)
@@ -129,6 +126,7 @@ gst_pulsesrc_class_init (GstPulseSrcClass * klass)
   GstAudioSrcClass *gstaudiosrc_class = GST_AUDIO_SRC_CLASS (klass);
   GstBaseSrcClass *gstbasesrc_class = GST_BASE_SRC_CLASS (klass);
   GstElementClass *gstelement_class = GST_ELEMENT_CLASS (klass);
+  GstCaps *caps;
   gchar *clientname;
 
   gobject_class->finalize = gst_pulsesrc_finalize;
@@ -190,7 +188,7 @@ gst_pulsesrc_class_init (GstPulseSrcClass * klass)
    * GstPulseSrc:stream-properties:
    *
    * List of pulseaudio stream properties. A list of defined properties can be
-   * found in the <ulink href="http://0pointer.de/lennart/projects/pulseaudio/doxygen/proplist_8h.html">pulseaudio api docs</ulink>.
+   * found in the [pulseaudio api docs](http://0pointer.de/lennart/projects/pulseaudio/doxygen/proplist_8h.html).
    *
    * Below is an example for registering as a music application to pulseaudio.
    * |[
@@ -222,7 +220,11 @@ gst_pulsesrc_class_init (GstPulseSrcClass * klass)
       "PulseAudio Audio Source",
       "Source/Audio",
       "Captures audio from a PulseAudio server", "Lennart Poettering");
-  gst_element_class_add_static_pad_template (gstelement_class, &pad_template);
+
+  caps = gst_pulse_fix_pcm_caps (gst_caps_from_string (_PULSE_CAPS_PCM));
+  gst_element_class_add_pad_template (gstelement_class,
+      gst_pad_template_new ("src", GST_PAD_SRC, GST_PAD_ALWAYS, caps));
+  gst_caps_unref (caps);
 
   /**
    * GstPulseSrc:volume:
@@ -622,7 +624,7 @@ gst_pulsesrc_set_stream_volume (GstPulseSrc * pulsesrc, gdouble volume)
   if (!pulsesrc->mainloop)
     goto no_mainloop;
 
-  if (!pulsesrc->source_output_idx)
+  if (pulsesrc->source_output_idx == PA_INVALID_INDEX)
     goto no_index;
 
   pa_threaded_mainloop_lock (pulsesrc->mainloop);
@@ -677,7 +679,7 @@ gst_pulsesrc_set_stream_mute (GstPulseSrc * pulsesrc, gboolean mute)
   if (!pulsesrc->mainloop)
     goto no_mainloop;
 
-  if (!pulsesrc->source_output_idx)
+  if (pulsesrc->source_output_idx == PA_INVALID_INDEX)
     goto no_index;
 
   pa_threaded_mainloop_lock (pulsesrc->mainloop);
@@ -730,7 +732,7 @@ gst_pulsesrc_set_stream_device (GstPulseSrc * pulsesrc, const gchar * device)
   if (!pulsesrc->mainloop)
     goto no_mainloop;
 
-  if (!pulsesrc->source_output_idx)
+  if (pulsesrc->source_output_idx == PA_INVALID_INDEX)
     goto no_index;
 
   pa_threaded_mainloop_lock (pulsesrc->mainloop);

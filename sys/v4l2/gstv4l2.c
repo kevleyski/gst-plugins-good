@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include "ext/videodev2.h"
+#include "gstv4l2elements.h"
 #include "v4l2-utils.h"
 
 #include "gstv4l2object.h"
@@ -47,16 +48,17 @@
 #include "gstv4l2sink.h"
 #include "gstv4l2radio.h"
 #include "gstv4l2videodec.h"
+#include "gstv4l2fwhtenc.h"
 #include "gstv4l2h263enc.h"
 #include "gstv4l2h264enc.h"
+#include "gstv4l2h265enc.h"
+#include "gstv4l2jpegenc.h"
 #include "gstv4l2mpeg4enc.h"
 #include "gstv4l2vp8enc.h"
 #include "gstv4l2vp9enc.h"
-#include "gstv4l2deviceprovider.h"
 #include "gstv4l2transform.h"
 
-/* used in gstv4l2object.c and v4l2_calls.c */
-GST_DEBUG_CATEGORY (v4l2_debug);
+GST_DEBUG_CATEGORY_EXTERN (v4l2_debug);
 #define GST_CAT_DEFAULT v4l2_debug
 
 #ifdef GST_V4L2_ENABLE_PROBE
@@ -125,6 +127,10 @@ gst_v4l2_probe_and_register (GstPlugin * plugin)
   struct v4l2_capability vcap;
   guint32 device_caps;
 
+  v4l2_element_init (plugin);
+
+  GST_DEBUG ("Probing devices");
+
   it = gst_v4l2_iterator_new ();
 
   while (gst_v4l2_iterator_next (it)) {
@@ -153,12 +159,7 @@ gst_v4l2_probe_and_register (GstPlugin * plugin)
     else
       device_caps = vcap.capabilities;
 
-    if (!((device_caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)) ||
-            /* But legacy driver may expose both CAPTURE and OUTPUT */
-            ((device_caps &
-                    (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) &&
-                (device_caps &
-                    (V4L2_CAP_VIDEO_OUTPUT | V4L2_CAP_VIDEO_OUTPUT_MPLANE)))))
+    if (!GST_V4L2_IS_M2M (device_caps))
       continue;
 
     GST_DEBUG ("Probing '%s' located at '%s'",
@@ -186,29 +187,45 @@ gst_v4l2_probe_and_register (GstPlugin * plugin)
 
     basename = g_path_get_basename (it->device_path);
 
+    /* Caps won't be freed if the subclass is not instantiated */
+    GST_MINI_OBJECT_FLAG_SET (sink_caps, GST_MINI_OBJECT_FLAG_MAY_BE_LEAKED);
+    GST_MINI_OBJECT_FLAG_SET (src_caps, GST_MINI_OBJECT_FLAG_MAY_BE_LEAKED);
+
     if (gst_v4l2_is_video_dec (sink_caps, src_caps)) {
       gst_v4l2_video_dec_register (plugin, basename, it->device_path,
-          sink_caps, src_caps);
+          video_fd, sink_caps, src_caps);
     } else if (gst_v4l2_is_video_enc (sink_caps, src_caps, NULL)) {
+      if (gst_v4l2_is_fwht_enc (sink_caps, src_caps))
+        gst_v4l2_fwht_enc_register (plugin, basename, it->device_path,
+            sink_caps, src_caps);
+
       if (gst_v4l2_is_h264_enc (sink_caps, src_caps))
         gst_v4l2_h264_enc_register (plugin, basename, it->device_path,
-            sink_caps, src_caps);
+            video_fd, sink_caps, src_caps);
+
+      if (gst_v4l2_is_h265_enc (sink_caps, src_caps))
+        gst_v4l2_h265_enc_register (plugin, basename, it->device_path,
+            video_fd, sink_caps, src_caps);
 
       if (gst_v4l2_is_mpeg4_enc (sink_caps, src_caps))
         gst_v4l2_mpeg4_enc_register (plugin, basename, it->device_path,
-            sink_caps, src_caps);
+            video_fd, sink_caps, src_caps);
 
       if (gst_v4l2_is_h263_enc (sink_caps, src_caps))
         gst_v4l2_h263_enc_register (plugin, basename, it->device_path,
             sink_caps, src_caps);
 
+      if (gst_v4l2_is_jpeg_enc (sink_caps, src_caps))
+        gst_v4l2_jpeg_enc_register (plugin, basename, it->device_path,
+            sink_caps, src_caps);
+
       if (gst_v4l2_is_vp8_enc (sink_caps, src_caps))
         gst_v4l2_vp8_enc_register (plugin, basename, it->device_path,
-            sink_caps, src_caps);
+            video_fd, sink_caps, src_caps);
 
       if (gst_v4l2_is_vp9_enc (sink_caps, src_caps))
         gst_v4l2_vp9_enc_register (plugin, basename, it->device_path,
-            sink_caps, src_caps);
+            video_fd, sink_caps, src_caps);
     } else if (gst_v4l2_is_transform (sink_caps, src_caps)) {
       gst_v4l2_transform_register (plugin, basename, it->device_path,
           sink_caps, src_caps);
@@ -232,37 +249,25 @@ gst_v4l2_probe_and_register (GstPlugin * plugin)
 static gboolean
 plugin_init (GstPlugin * plugin)
 {
+  gboolean ret = FALSE;
   const gchar *paths[] = { "/dev", "/dev/v4l2", NULL };
   const gchar *names[] = { "video", NULL };
 
-  GST_DEBUG_CATEGORY_INIT (v4l2_debug, "v4l2", 0, "V4L2 API calls");
-
-  /* Add some depedency, so the dynamic features get updated upon changes in
+  /* Add some dependency, so the dynamic features get updated upon changes in
    * /dev/video* */
   gst_plugin_add_dependency (plugin,
       NULL, paths, names, GST_PLUGIN_DEPENDENCY_FLAG_FILE_NAME_IS_PREFIX);
 
-  if (!gst_element_register (plugin, "v4l2src", GST_RANK_PRIMARY,
-          GST_TYPE_V4L2SRC) ||
-      !gst_element_register (plugin, "v4l2sink", GST_RANK_NONE,
-          GST_TYPE_V4L2SINK) ||
-      !gst_element_register (plugin, "v4l2radio", GST_RANK_NONE,
-          GST_TYPE_V4L2RADIO) ||
-      !gst_device_provider_register (plugin, "v4l2deviceprovider",
-          GST_RANK_PRIMARY, GST_TYPE_V4L2_DEVICE_PROVIDER)
-      /* etc. */
 #ifdef GST_V4L2_ENABLE_PROBE
-      || !gst_v4l2_probe_and_register (plugin)
+  ret |= gst_v4l2_probe_and_register (plugin);
 #endif
-      )
-    return FALSE;
 
-#ifdef ENABLE_NLS
-  bindtextdomain (GETTEXT_PACKAGE, LOCALEDIR);
-  bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
-#endif /* ENABLE_NLS */
+  ret |= GST_ELEMENT_REGISTER (v4l2src, plugin);
+  ret |= GST_ELEMENT_REGISTER (v4l2sink, plugin);
+  ret |= GST_ELEMENT_REGISTER (v4l2radio, plugin);
+  ret |= GST_DEVICE_PROVIDER_REGISTER (v4l2deviceprovider, plugin);
 
-  return TRUE;
+  return ret;
 }
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,

@@ -1,4 +1,5 @@
 wavpack_sources = [
+  'gstwavpackelement.c',
   'gstwavpack.c',
   'gstwavpackcommon.c',
   'gstwavpackdec.c',
@@ -6,7 +7,7 @@ wavpack_sources = [
   'gstwavpackstreamreader.c',
 ]
 
-wavpack_dep = dependency('wavpack', version : '>= 4.60.0', required : false)
+wavpack_dep = dependency('wavpack', version : '>= 4.60.0', required : get_option('wavpack'))
 
 if wavpack_dep.found()
   gstwavpack = library('gstwavpack',
@@ -19,4 +20,5 @@ if wavpack_dep.found()
     install_dir : plugins_install_dir,
   )
   pkgconfig.generate(gstwavpack, install_dir : plugins_pkgconfig_install_dir)
+  plugins += [gstwavpack]
 endif

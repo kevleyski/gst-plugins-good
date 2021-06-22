@@ -26,6 +26,7 @@
 #include <gst/rtp/gstrtpbuffer.h>
 #include <gst/audio/audio.h>
 
+#include "gstrtpelements.h"
 #include "fnv1hash.h"
 #include "gstrtpvorbispay.h"
 #include "gstrtputils.h"
@@ -70,6 +71,8 @@ enum
 
 #define gst_rtp_vorbis_pay_parent_class parent_class
 G_DEFINE_TYPE (GstRtpVorbisPay, gst_rtp_vorbis_pay, GST_TYPE_RTP_BASE_PAYLOAD);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (rtpvorbispay, "rtpvorbispay",
+    GST_RANK_SECONDARY, GST_TYPE_RTP_VORBIS_PAY, rtp_element_init (plugin));
 
 static gboolean gst_rtp_vorbis_pay_setcaps (GstRTPBasePayload * basepayload,
     GstCaps * caps);
@@ -270,14 +273,18 @@ static void
 gst_rtp_vorbis_pay_init_packet (GstRtpVorbisPay * rtpvorbispay, guint8 VDT,
     GstClockTime timestamp)
 {
+  guint len;
+
   GST_LOG_OBJECT (rtpvorbispay, "starting new packet, VDT: %d", VDT);
 
   gst_rtp_vorbis_pay_clear_packet (rtpvorbispay);
 
   /* new packet allocate max packet size */
-  rtpvorbispay->packet =
-      gst_rtp_buffer_new_allocate_len (GST_RTP_BASE_PAYLOAD_MTU
+  len = gst_rtp_buffer_calc_payload_len (GST_RTP_BASE_PAYLOAD_MTU
       (rtpvorbispay), 0, 0);
+  rtpvorbispay->packet =
+      gst_rtp_base_payload_allocate_output_buffer (GST_RTP_BASE_PAYLOAD
+      (rtpvorbispay), len, 0, 0);
   gst_rtp_vorbis_pay_reset_packet (rtpvorbispay, VDT);
 
   GST_BUFFER_PTS (rtpvorbispay->packet) = timestamp;
@@ -829,17 +836,21 @@ gst_rtp_vorbis_pay_handle_buffer (GstRTPBasePayload * basepayload,
   /* there is a config request, see if we need to insert it */
   if (rtpvorbispay->config_interval > 0 && rtpvorbispay->config_data) {
     gboolean send_config = FALSE;
+    GstClockTime running_time =
+        gst_segment_to_running_time (&basepayload->segment, GST_FORMAT_TIME,
+        timestamp);
 
     if (rtpvorbispay->last_config != -1) {
       guint64 diff;
 
       GST_LOG_OBJECT (rtpvorbispay,
           "now %" GST_TIME_FORMAT ", last config %" GST_TIME_FORMAT,
-          GST_TIME_ARGS (timestamp), GST_TIME_ARGS (rtpvorbispay->last_config));
+          GST_TIME_ARGS (running_time),
+          GST_TIME_ARGS (rtpvorbispay->last_config));
 
       /* calculate diff between last config in milliseconds */
-      if (timestamp > rtpvorbispay->last_config) {
-        diff = timestamp - rtpvorbispay->last_config;
+      if (running_time > rtpvorbispay->last_config) {
+        diff = running_time - rtpvorbispay->last_config;
       } else {
         diff = 0;
       }
@@ -848,7 +859,6 @@ gst_rtp_vorbis_pay_handle_buffer (GstRTPBasePayload * basepayload,
           "interval since last config %" GST_TIME_FORMAT, GST_TIME_ARGS (diff));
 
       /* bigger than interval, queue config */
-      /* FIXME should convert timestamps to running time */
       if (GST_TIME_AS_SECONDS (diff) >= rtpvorbispay->config_interval) {
         GST_DEBUG_OBJECT (rtpvorbispay, "time to send config");
         send_config = TRUE;
@@ -866,8 +876,8 @@ gst_rtp_vorbis_pay_handle_buffer (GstRTPBasePayload * basepayload,
           NULL, rtpvorbispay->config_data, rtpvorbispay->config_size,
           timestamp, GST_CLOCK_TIME_NONE, rtpvorbispay->config_extra_len);
 
-      if (timestamp != -1) {
-        rtpvorbispay->last_config = timestamp;
+      if (running_time != -1) {
+        rtpvorbispay->last_config = running_time;
       }
     }
   }
@@ -989,11 +999,4 @@ gst_rtp_vorbis_pay_get_property (GObject * object, guint prop_id,
     default:
       break;
   }
-}
-
-gboolean
-gst_rtp_vorbis_pay_plugin_init (GstPlugin * plugin)
-{
-  return gst_element_register (plugin, "rtpvorbispay",
-      GST_RANK_SECONDARY, GST_TYPE_RTP_VORBIS_PAY);
 }

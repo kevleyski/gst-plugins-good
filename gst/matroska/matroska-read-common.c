@@ -39,6 +39,7 @@
 
 #include <gst/tag/tag.h>
 #include <gst/base/gsttypefindhelper.h>
+#include <gst/base/gstbytewriter.h>
 
 #include "lzo.h"
 
@@ -262,9 +263,9 @@ gst_matroska_decode_content_encodings (GArray * encodings)
         == 0)
       continue;
 
-    /* Encryption not supported yet */
-    if (enc->type != 0)
-      return GST_FLOW_ERROR;
+    /* Other than ENCODING_COMPRESSION not handled here */
+    if (enc->type != GST_MATROSKA_ENCODING_COMPRESSION)
+      continue;
 
     if (i + 1 >= encodings->len)
       return GST_FLOW_ERROR;
@@ -312,9 +313,9 @@ gst_matroska_decode_data (GArray * encodings, gpointer * data_out,
     if ((enc->scope & scope) == 0)
       continue;
 
-    /* Encryption not supported yet */
-    if (enc->type != 0) {
-      ret = FALSE;
+    /* Encryption not handled here */
+    if (enc->type != GST_MATROSKA_ENCODING_COMPRESSION) {
+      ret = TRUE;
       break;
     }
 
@@ -347,6 +348,211 @@ gst_matroska_decode_data (GArray * encodings, gpointer * data_out,
   }
 
   return ret;
+}
+
+/* This function parses the protection info of Block/SimpleBlock and extracts the
+ * IV and partitioning format (subsample) information.
+ * Set those parsed information into protection info structure @info_protect which
+ * will be added in protection metadata of the Gstbuffer.
+ * The subsamples format follows the same pssh box format in Common Encryption spec:
+ * subsample number + clear subsample size (16bit bigendian) | encrypted subsample size (32bit bigendian) | ...
+ * @encrypted is an output argument: TRUE if the current Block/SimpleBlock is encrypted else FALSE
+ */
+gboolean
+gst_matroska_parse_protection_meta (gpointer * data_out, gsize * size_out,
+    GstStructure * info_protect, gboolean * encrypted)
+{
+  guint8 *data;
+  GstBuffer *buf_iv;
+  guint8 *data_iv;
+  guint8 *subsamples;
+  guint8 signal_byte;
+  gint i;
+  GstByteReader reader;
+
+  g_return_val_if_fail (data_out != NULL && *data_out != NULL, FALSE);
+  g_return_val_if_fail (size_out != NULL, FALSE);
+  g_return_val_if_fail (info_protect != NULL, FALSE);
+  g_return_val_if_fail (encrypted != NULL, FALSE);
+
+  *encrypted = FALSE;
+  data = *data_out;
+  gst_byte_reader_init (&reader, data, *size_out);
+
+  /* WebM spec:
+   * 4.7 Signal Byte Format
+   *  0 1 2 3 4 5 6 7
+   * +-+-+-+-+-+-+-+-+
+   * |X|   RSV   |P|E|
+   * +-+-+-+-+-+-+-+-+
+   *
+   * Extension bit (X)
+   * If set, another signal byte will follow this byte. Reserved for future expansion (currently MUST be set to 0).
+   * RSV bits (RSV)
+   * Bits reserved for future use. MUST be set to 0 and MUST be ignored.
+   * Encrypted bit (E)
+   * If set, the Block MUST contain an IV immediately followed by an encrypted frame. If not set, the Block MUST NOT include an IV and the frame MUST be unencrypted. The unencrypted frame MUST immediately follow the Signal Byte.
+   * Partitioned bit (P)
+   * Used to indicate that the sample has subsample partitions. If set, the IV will be followed by a num_partitions byte, and num_partitions * 32-bit partition offsets. This bit can only be set if the E bit is also set.
+   */
+  if (!gst_byte_reader_get_uint8 (&reader, &signal_byte)) {
+    GST_ERROR ("Error reading the signal byte");
+    return FALSE;
+  }
+
+  /* Unencrypted buffer */
+  if (!(signal_byte & GST_MATROSKA_BLOCK_ENCRYPTED)) {
+    return TRUE;
+  }
+
+  /* Encrypted buffer */
+  *encrypted = TRUE;
+  /* Create IV buffer */
+  if (!gst_byte_reader_dup_data (&reader, sizeof (guint64), &data_iv)) {
+    GST_ERROR ("Error reading the IV data");
+    return FALSE;
+  }
+  buf_iv = gst_buffer_new_wrapped ((gpointer) data_iv, sizeof (guint64));
+  gst_structure_set (info_protect, "iv", GST_TYPE_BUFFER, buf_iv, NULL);
+  gst_buffer_unref (buf_iv);
+
+  /* Partitioned in subsample */
+  if (signal_byte & GST_MATROSKA_BLOCK_PARTITIONED) {
+    guint nb_subsample;
+    guint32 offset = 0;
+    guint32 offset_prev;
+    guint32 encrypted_bytes = 0;
+    guint16 clear_bytes = 0;
+    GstBuffer *buf_sub_sample;
+    guint8 nb_part;
+    GstByteWriter writer;
+
+    /* Read the number of partitions (1 byte) */
+    if (!gst_byte_reader_get_uint8 (&reader, &nb_part)) {
+      GST_ERROR ("Error reading the partition number");
+      return FALSE;
+    }
+
+    if (nb_part == 0) {
+      GST_ERROR ("Partitioned, but the subsample number equal to zero");
+      return FALSE;
+    }
+
+    nb_subsample = (nb_part + 2) >> 1;
+
+    gst_structure_set (info_protect, "subsample_count", G_TYPE_UINT,
+        nb_subsample, NULL);
+
+    /* WebM Spec:
+     *
+     * 4.6 Subsample Encrypted Block Format
+     *
+     * The Subsample Encrypted Block format extends the Full-sample format by setting a "partitioned" (P) bit in the Signal Byte.
+     * If this bit is set, the EncryptedBlock header shall include an
+     * 8-bit integer indicating the number of sample partitions (dividers between clear/encrypted sections),
+     * and a series of 32-bit integers in big-endian encoding indicating the byte offsets of such partitions.
+     *
+     *  0                   1                   2                   3
+     *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * |  Signal Byte  |                                               |
+     * +-+-+-+-+-+-+-+-+             IV                                |
+     * |                                                               |
+     * |               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * |               | num_partition |     Partition 0 offset ->     |
+     * |-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-|
+     * |     -> Partition 0 offset     |              ...              |
+     * |-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-|
+     * |             ...               |     Partition n-1 offset ->   |
+     * |-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-|
+     * |     -> Partition n-1 offset   |                               |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               |
+     * |                    Clear/encrypted sample data                |
+     * |                                                               |
+     * |                                                               |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     *
+     * 4.6.1 SAMPLE PARTITIONS
+     *
+     * The samples shall be partitioned into alternating clear and encrypted sections,
+     * always starting with a clear section.
+     * Generally for n clear/encrypted sections there shall be n-1 partition offsets.
+     * However, if it is required that the first section be encrypted, then the first partition shall be at byte offset 0
+     * (indicating a zero-size clear section), and there shall be n partition offsets.
+     * Please refer to the "Sample Encryption" description of the "Common Encryption"
+     * section of the VP Codec ISO Media File Format Binding Specification for more
+     * detail on how subsample encryption is implemented.
+     */
+    subsamples =
+        g_malloc (nb_subsample * (sizeof (guint16) + sizeof (guint32)));
+
+    gst_byte_writer_init_with_data (&writer, subsamples,
+        nb_subsample * (sizeof (guint16) + sizeof (guint32)), FALSE);
+
+    for (i = 0; i <= nb_part; i++) {
+      offset_prev = offset;
+      if (i == nb_part) {
+        offset = gst_byte_reader_get_remaining (&reader);
+      } else {
+        if (!gst_byte_reader_get_uint32_be (&reader, &offset)) {
+          GST_ERROR ("Error reading the partition offset");
+          goto release_err;
+        }
+      }
+
+      if (offset < offset_prev) {
+        GST_ERROR ("Partition offsets should not decrease");
+        goto release_err;
+      }
+
+      if (i % 2 == 0) {
+        if ((offset - offset_prev) & 0xFFFF0000) {
+          GST_ERROR
+              ("The Clear Partition exceed 64KB in encrypted subsample format");
+          goto release_err;
+        }
+        /* We set the Clear partition size in 16 bits, in order to
+         * follow the same format of the box PSSH in CENC spec */
+        clear_bytes = offset - offset_prev;
+        if (i == nb_part)
+          encrypted_bytes = 0;
+      } else {
+        encrypted_bytes = offset - offset_prev;
+      }
+
+      if ((i % 2 == 1) || (i == nb_part)) {
+        if (clear_bytes == 0 && encrypted_bytes == 0) {
+          GST_ERROR ("Found 2 partitions with the same offsets.");
+          goto release_err;
+        }
+        if (!gst_byte_writer_put_uint16_be (&writer, clear_bytes)) {
+          GST_ERROR ("Error writing the number of clear bytes");
+          goto release_err;
+        }
+        if (!gst_byte_writer_put_uint32_be (&writer, encrypted_bytes)) {
+          GST_ERROR ("Error writing the number of encrypted bytes");
+          goto release_err;
+        }
+      }
+    }
+
+    buf_sub_sample =
+        gst_buffer_new_wrapped (subsamples,
+        nb_subsample * (sizeof (guint16) + sizeof (guint32)));
+    gst_structure_set (info_protect, "subsamples", GST_TYPE_BUFFER,
+        buf_sub_sample, NULL);
+    gst_buffer_unref (buf_sub_sample);
+  } else {
+    gst_structure_set (info_protect, "subsample_count", G_TYPE_UINT, 0, NULL);
+  }
+
+  gst_byte_reader_get_data (&reader, 0, (const guint8 **) data_out);
+  *size_out = gst_byte_reader_get_remaining (&reader);
+  return TRUE;
+
+release_err:
+  g_free (subsamples);
+  return FALSE;
 }
 
 static gint
@@ -591,7 +797,7 @@ gst_matroska_read_common_parse_attached_file (GstMatroskaReadCommon * common,
 
   DEBUG_ELEMENT_STOP (common, ebml, "AttachedFile", ret);
 
-  if (filename && mimetype && data && datalen > 0) {
+  if (filename && mimetype && data && datalen > 0 && datalen < G_MAXUINT) {
     GstTagImageType image_type = GST_TAG_IMAGE_TYPE_NONE;
     GstBuffer *tagbuffer = NULL;
     GstSample *tagsample = NULL;
@@ -637,7 +843,7 @@ gst_matroska_read_common_parse_attached_file (GstMatroskaReadCommon * common,
 
     /* if this failed create an attachment buffer */
     if (!tagbuffer) {
-      tagbuffer = gst_buffer_new_wrapped (g_memdup (data, datalen), datalen);
+      tagbuffer = gst_buffer_new_memdup (data, datalen);
 
       caps = gst_type_find_helper_for_buffer (NULL, tagbuffer, NULL);
       if (caps == NULL)
@@ -1235,7 +1441,7 @@ gst_matroska_read_common_parse_header (GstMatroskaReadCommon * common,
       goto exit_error;
 
     switch (id) {
-        /* is our read version uptodate? */
+        /* is our read version up-to-date? */
       case GST_EBML_ID_EBMLREADVERSION:{
         guint64 num;
 
@@ -1768,12 +1974,20 @@ gst_matroska_read_common_parse_info (GstMatroskaReadCommon * common,
 
       case GST_MATROSKA_ID_DATEUTC:{
         gint64 time;
+        GstDateTime *datetime;
+        GstTagList *taglist;
 
         if ((ret = gst_ebml_read_date (ebml, &id, &time)) != GST_FLOW_OK)
           break;
 
         GST_DEBUG_OBJECT (common->sinkpad, "DateUTC: %" G_GINT64_FORMAT, time);
         common->created = time;
+        datetime =
+            gst_date_time_new_from_unix_epoch_utc_usecs (time / GST_USECOND);
+        taglist = gst_tag_list_new (GST_TAG_DATE_TIME, datetime, NULL);
+        gst_tag_list_set_scope (taglist, GST_TAG_SCOPE_GLOBAL);
+        gst_matroska_read_common_found_global_tag (common, el, taglist);
+        gst_date_time_unref (datetime);
         break;
       }
 
@@ -1837,6 +2051,8 @@ gst_matroska_read_common_parse_metadata_id_simple_tag (GstMatroskaReadCommon *
     const gchar *matroska_tagname;
     const gchar *gstreamer_tagname;
   }
+
+  /* *INDENT-OFF* */
   tag_conv[] = {
     {
       /* The following list has the _same_ order as the one in Matroska spec. Please, don't mess it up. */
@@ -1917,18 +2133,18 @@ gst_matroska_read_common_parse_metadata_id_simple_tag (GstMatroskaReadCommon *
       /* ICRA The ICRA content rating for parental control. (Previously RSACi) */
 
       /* Temporal Information */
-    GST_MATROSKA_TAG_ID_DATE_RELEASED, GST_TAG_DATE}, { /* The time that the item was originaly released. This is akin to the TDRL tag in ID3. */
+    GST_MATROSKA_TAG_ID_DATE_RELEASED, GST_TAG_DATE}, { /* The time that the item was originally released. This is akin to the TDRL tag in ID3. */
     GST_MATROSKA_TAG_ID_DATE_RECORDED, GST_TAG_DATE}, { /* The time that the recording began. This is akin to the TDRC tag in ID3. */
     GST_MATROSKA_TAG_ID_DATE_ENCODED, GST_TAG_DATE}, {  /* The time that the encoding of this item was completed began. This is akin to the TDEN tag in ID3. */
     GST_MATROSKA_TAG_ID_DATE_TAGGED, GST_TAG_DATE}, {   /* The time that the tags were done for this item. This is akin to the TDTG tag in ID3. */
-    GST_MATROSKA_TAG_ID_DATE_DIGITIZED, GST_TAG_DATE}, {        /* The time that the item was tranfered to a digital medium. This is akin to the IDIT tag in RIFF. */
+    GST_MATROSKA_TAG_ID_DATE_DIGITIZED, GST_TAG_DATE}, {        /* The time that the item was transferred to a digital medium. This is akin to the IDIT tag in RIFF. */
     GST_MATROSKA_TAG_ID_DATE_WRITTEN, GST_TAG_DATE}, {  /* The time that the writing of the music/script began. */
     GST_MATROSKA_TAG_ID_DATE_PURCHASED, GST_TAG_DATE}, {        /* Information on when the file was purchased (see also purchase tags). */
     GST_MATROSKA_TAG_ID_DATE, GST_TAG_DATE}, {  /* Matroska spec does NOT have this tag! Dunno what it was doing here, probably for compatibility. */
 
       /* Spacial Information */
     GST_MATROSKA_TAG_ID_RECORDING_LOCATION, GST_TAG_GEO_LOCATION_NAME}, {       /* The location where the item was recorded. The countries corresponding to the string, same 2 octets as in Internet domains, or possibly ISO-3166. This code is followed by a comma, then more detailed information such as state/province, another comma, and then city. For example, "US, Texas, Austin". This will allow for easy sorting. It is okay to only store the country, or the country and the state/province. More detailed information can be added after the city through the use of additional commas. In cases where the province/state is unknown, but you want to store the city, simply leave a space between the two commas. For example, "US, , Austin". */
-      /* COMPOSITION_LOCATION Location that the item was originaly designed/written. The countries corresponding to the string, same 2 octets as in Internet domains, or possibly ISO-3166. This code is followed by a comma, then more detailed information such as state/province, another comma, and then city. For example, "US, Texas, Austin". This will allow for easy sorting. It is okay to only store the country, or the country and the state/province. More detailed information can be added after the city through the use of additional commas. In cases where the province/state is unknown, but you want to store the city, simply leave a space between the two commas. For example, "US, , Austin". */
+      /* COMPOSITION_LOCATION Location that the item was originally designed/written. The countries corresponding to the string, same 2 octets as in Internet domains, or possibly ISO-3166. This code is followed by a comma, then more detailed information such as state/province, another comma, and then city. For example, "US, Texas, Austin". This will allow for easy sorting. It is okay to only store the country, or the country and the state/province. More detailed information can be added after the city through the use of additional commas. In cases where the province/state is unknown, but you want to store the city, simply leave a space between the two commas. For example, "US, , Austin". */
       /* COMPOSER_NATIONALITY Nationality of the main composer of the item, mostly for classical music. The countries corresponding to the string, same 2 octets as in Internet domains, or possibly ISO-3166. */
 
       /* Personal */
@@ -1942,7 +2158,7 @@ gst_matroska_read_common_parse_metadata_id_simple_tag (GstMatroskaReadCommon *
       /* ENCODER_SETTINGS A list of the settings used for encoding this item. No specific format. */
     GST_MATROSKA_TAG_ID_BPS, GST_TAG_BITRATE}, {
     GST_MATROSKA_TAG_ID_BITSPS, GST_TAG_BITRATE}, {     /* Matroska spec does NOT have this tag! Dunno what it was doing here, probably for compatibility. */
-      /* WONTFIX (already handled in another way): FPS The average frames per second of the specified item. This is typically the average number of Blocks per second. In the event that lacing is used, each laced chunk is to be counted as a seperate frame. */
+      /* WONTFIX (already handled in another way): FPS The average frames per second of the specified item. This is typically the average number of Blocks per second. In the event that lacing is used, each laced chunk is to be counted as a separate frame. */
     GST_MATROSKA_TAG_ID_BPM, GST_TAG_BEATS_PER_MINUTE}, {
       /* MEASURE In music, a measure is a unit of time in Western music like "4/4". It represents a regular grouping of beats, a meter, as indicated in musical notation by the time signature.. The majority of the contemporary rock and pop music you hear on the radio these days is written in the 4/4 time signature. */
       /* TUNING It is saved as a frequency in hertz to allow near-perfect tuning of instruments to the same tone as the musical piece (e.g. "441.34" in Hertz). The default value is 440.0 Hz. */
@@ -1971,11 +2187,14 @@ gst_matroska_read_common_parse_metadata_id_simple_tag (GstMatroskaReadCommon *
     GST_MATROSKA_TAG_ID_LICENSE, GST_TAG_LICENSE}, {    /* The license applied to the content (like Creative Commons variants). */
     GST_MATROSKA_TAG_ID_TERMS_OF_USE, GST_TAG_LICENSE}
   };
+  /* *INDENT-ON* */
   static const struct
   {
     const gchar *matroska_tagname;
     const gchar *gstreamer_tagname;
   }
+
+  /* *INDENT-OFF* */
   child_tag_conv[] = {
     {
     "TITLE/SORT_WITH=", GST_TAG_TITLE_SORTNAME}, {
@@ -1992,6 +2211,7 @@ gst_matroska_read_common_parse_metadata_id_simple_tag (GstMatroskaReadCommon *
     "LICENSE/URL=", GST_TAG_LICENSE_URI}, {
     "LICENSE/URL=", GST_TAG_LICENSE_URI}
   };
+  /* *INDENT-ON* */
   GstFlowReturn ret;
   guint32 id;
   gchar *value = NULL;
@@ -2744,9 +2964,11 @@ gst_matroska_read_common_read_track_encoding (GstMatroskaReadCommon * common,
               G_GUINT64_FORMAT, num);
           ret = GST_FLOW_ERROR;
           break;
-        } else if (num != 0) {
+        }
+
+        if ((!common->is_webm) && (num == GST_MATROSKA_ENCODING_ENCRYPTION)) {
           GST_ERROR_OBJECT (common->sinkpad,
-              "Encrypted tracks are not supported yet");
+              "Encrypted tracks are supported only in WebM");
           ret = GST_FLOW_ERROR;
           break;
         }
@@ -2812,12 +3034,132 @@ gst_matroska_read_common_read_track_encoding (GstMatroskaReadCommon * common,
         break;
       }
 
-      case GST_MATROSKA_ID_CONTENTENCRYPTION:
-        GST_ERROR_OBJECT (common->sinkpad,
-            "Encrypted tracks not yet supported");
-        gst_ebml_read_skip (ebml);
-        ret = GST_FLOW_ERROR;
+      case GST_MATROSKA_ID_CONTENTENCRYPTION:{
+
+        DEBUG_ELEMENT_START (common, ebml, "ContentEncryption");
+
+        if (enc.type != GST_MATROSKA_ENCODING_ENCRYPTION) {
+          GST_WARNING_OBJECT (common->sinkpad,
+              "Unexpected to have Content Encryption because it isn't encryption type");
+          ret = GST_FLOW_ERROR;
+          break;
+        }
+
+        if ((ret = gst_ebml_read_master (ebml, &id)) != GST_FLOW_OK)
+          break;
+
+        while (ret == GST_FLOW_OK &&
+            gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+          if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK)
+            break;
+
+          switch (id) {
+            case GST_MATROSKA_ID_CONTENTENCALGO:{
+              guint64 num;
+
+              if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK) {
+                break;
+              }
+
+              if (num > GST_MATROSKA_TRACK_ENCRYPTION_ALGORITHM_AES) {
+                GST_ERROR_OBJECT (common->sinkpad, "Invalid ContentEncAlgo %"
+                    G_GUINT64_FORMAT, num);
+                ret = GST_FLOW_ERROR;
+                break;
+              }
+              GST_DEBUG_OBJECT (common->sinkpad,
+                  "ContentEncAlgo: %" G_GUINT64_FORMAT, num);
+              enc.enc_algo = num;
+
+              break;
+            }
+            case GST_MATROSKA_ID_CONTENTENCAESSETTINGS:{
+
+              DEBUG_ELEMENT_START (common, ebml, "ContentEncAESSettings");
+
+              if ((ret = gst_ebml_read_master (ebml, &id)) != GST_FLOW_OK)
+                break;
+
+              while (ret == GST_FLOW_OK &&
+                  gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+                if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK)
+                  break;
+
+                switch (id) {
+                  case GST_MATROSKA_ID_AESSETTINGSCIPHERMODE:{
+                    guint64 num;
+
+                    if ((ret =
+                            gst_ebml_read_uint (ebml, &id,
+                                &num)) != GST_FLOW_OK) {
+                      break;
+                    }
+                    if (num > 3) {
+                      GST_ERROR_OBJECT (common->sinkpad, "Invalid Cipher Mode %"
+                          G_GUINT64_FORMAT, num);
+                      ret = GST_FLOW_ERROR;
+                      break;
+                    }
+                    GST_DEBUG_OBJECT (common->sinkpad,
+                        "ContentEncAESSettings: %" G_GUINT64_FORMAT, num);
+                    enc.enc_cipher_mode = num;
+                    break;
+                  }
+                  default:
+                    GST_WARNING_OBJECT (common->sinkpad,
+                        "Unknown ContentEncAESSettings subelement 0x%x - ignoring",
+                        id);
+                    ret = gst_ebml_read_skip (ebml);
+                    break;
+                }
+              }
+              DEBUG_ELEMENT_STOP (common, ebml, "ContentEncAESSettings", ret);
+              break;
+            }
+
+            case GST_MATROSKA_ID_CONTENTENCKEYID:{
+              guint8 *data;
+              guint64 size;
+              GstBuffer *keyId_buf;
+              GstEvent *event;
+
+              if ((ret =
+                      gst_ebml_read_binary (ebml, &id, &data,
+                          &size)) != GST_FLOW_OK) {
+                break;
+              }
+              GST_DEBUG_OBJECT (common->sinkpad,
+                  "ContentEncrypt KeyID length : %" G_GUINT64_FORMAT, size);
+              keyId_buf = gst_buffer_new_wrapped (data, size);
+
+              /* Push an event containing the Key ID into the queues of all streams. */
+              /* system_id field is set to GST_PROTECTION_UNSPECIFIED_SYSTEM_ID because it isn't specified neither in WebM nor in Matroska spec. */
+              event =
+                  gst_event_new_protection
+                  (GST_PROTECTION_UNSPECIFIED_SYSTEM_ID, keyId_buf,
+                  "matroskademux");
+              GST_TRACE_OBJECT (common->sinkpad,
+                  "adding protection event for stream %d", context->index);
+              g_queue_push_tail (&context->protection_event_queue, event);
+
+              context->protection_info =
+                  gst_structure_new ("application/x-cenc", "iv_size",
+                  G_TYPE_UINT, 8, "encrypted", G_TYPE_BOOLEAN, TRUE, "kid",
+                  GST_TYPE_BUFFER, keyId_buf, NULL);
+
+              gst_buffer_unref (keyId_buf);
+              break;
+            }
+            default:
+              GST_WARNING_OBJECT (common->sinkpad,
+                  "Unknown ContentEncryption subelement 0x%x - ignoring", id);
+              ret = gst_ebml_read_skip (ebml);
+              break;
+          }
+        }
+        DEBUG_ELEMENT_STOP (common, ebml, "ContentEncryption", ret);
         break;
+      }
       default:
         GST_WARNING_OBJECT (common->sinkpad,
             "Unknown ContentEncoding subelement 0x%x - ignoring", id);
@@ -2955,7 +3297,6 @@ gst_matroska_read_common_reset (GstElement * element,
       if (context->pad != NULL)
         gst_element_remove_pad (element, context->pad);
 
-      gst_caps_replace (&context->caps, NULL);
       gst_matroska_track_free (context);
     }
     g_ptr_array_free (ctx->src, TRUE);

@@ -22,15 +22,15 @@
 
 /**
  * SECTION:element-jpegdec
+ * @title: jpegdec
  *
  * Decodes jpeg images.
  *
- * <refsect2>
- * <title>Example launch line</title>
+ * ## Example launch line
  * |[
  * gst-launch-1.0 -v filesrc location=mjpeg.avi ! avidemux !  queue ! jpegdec ! videoconvert ! videoscale ! autovideosink
  * ]| The above pipeline decode the mjpeg stream and renders it to the screen.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -38,8 +38,9 @@
 #endif
 #include <string.h>
 
-#include "gstjpegdec.h"
 #include "gstjpeg.h"
+#include "gstjpegdec.h"
+#include "gstjpegelements.h"
 #include <gst/video/video.h>
 #include <gst/video/gstvideometa.h>
 #include <gst/video/gstvideopool.h>
@@ -109,6 +110,8 @@ static gboolean gst_jpeg_dec_sink_event (GstVideoDecoder * bdec,
 
 #define gst_jpeg_dec_parent_class parent_class
 G_DEFINE_TYPE (GstJpegDec, gst_jpeg_dec, GST_TYPE_VIDEO_DECODER);
+GST_ELEMENT_REGISTER_DEFINE (jpegdec, "jpegdec", GST_RANK_PRIMARY,
+    GST_TYPE_JPEG_DEC);
 
 static void
 gst_jpeg_dec_finalize (GObject * object)
@@ -181,6 +184,8 @@ gst_jpeg_dec_class_init (GstJpegDecClass * klass)
 
   GST_DEBUG_CATEGORY_INIT (jpeg_dec_debug, "jpegdec", 0, "JPEG decoder");
   GST_DEBUG_CATEGORY_GET (GST_CAT_PERFORMANCE, "GST_PERFORMANCE");
+
+  gst_type_mark_as_plugin_api (GST_TYPE_IDCT_METHOD, 0);
 }
 
 static boolean
@@ -894,6 +899,12 @@ gst_jpeg_dec_decode_direct (GstJpegDec * dec, GstVideoFrame * frame,
     }
   }
 
+  if (height % (v_samp[0] * DCTSIZE) && (dec->scratch_size < stride[0])) {
+    g_free (dec->scratch);
+    dec->scratch = g_malloc (stride[0]);
+    dec->scratch_size = stride[0];
+  }
+
   /* let jpeglib decode directly into our final buffer */
   GST_DEBUG_OBJECT (dec, "decoding directly into output buffer");
 
@@ -902,7 +913,7 @@ gst_jpeg_dec_decode_direct (GstJpegDec * dec, GstVideoFrame * frame,
       /* Y */
       line[0][j] = base[0] + (i + j) * stride[0];
       if (G_UNLIKELY (line[0][j] > last[0]))
-        line[0][j] = last[0];
+        line[0][j] = dec->scratch;
       /* U */
       if (v_samp[1] == v_samp[0]) {
         line[1][j] = base[1] + ((i + j) / 2) * stride[1];
@@ -910,7 +921,7 @@ gst_jpeg_dec_decode_direct (GstJpegDec * dec, GstVideoFrame * frame,
         line[1][j] = base[1] + ((i / 2) + j) * stride[1];
       }
       if (G_UNLIKELY (line[1][j] > last[1]))
-        line[1][j] = last[1];
+        line[1][j] = dec->scratch;
       /* V */
       if (v_samp[2] == v_samp[0]) {
         line[2][j] = base[2] + ((i + j) / 2) * stride[2];
@@ -918,7 +929,7 @@ gst_jpeg_dec_decode_direct (GstJpegDec * dec, GstVideoFrame * frame,
         line[2][j] = base[2] + ((i / 2) + j) * stride[2];
       }
       if (G_UNLIKELY (line[2][j] > last[2]))
-        line[2][j] = last[2];
+        line[2][j] = dec->scratch;
     }
 
     lines = jpeg_read_raw_data (&dec->cinfo, line, v_samp[0] * DCTSIZE);
@@ -984,6 +995,9 @@ gst_jpeg_dec_negotiate (GstJpegDec * dec, gint width, gint height, gint clrspc,
     case JCS_GRAYSCALE:
       break;
     default:
+      /* aka JPEG chroma siting */
+      outstate->info.chroma_site = GST_VIDEO_CHROMA_SITE_NONE;
+
       outstate->info.colorimetry.range = GST_VIDEO_COLOR_RANGE_0_255;
       outstate->info.colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_BT601;
       outstate->info.colorimetry.transfer = GST_VIDEO_TRANSFER_UNKNOWN;
@@ -1198,11 +1212,15 @@ gst_jpeg_dec_handle_frame (GstVideoDecoder * bdec, GstVideoCodecFrame * frame)
   guint8 *data;
   gsize nbytes;
 
-  gst_buffer_map (frame->input_buffer, &dec->current_frame_map, GST_MAP_READ);
+  if (!gst_buffer_map (frame->input_buffer, &dec->current_frame_map,
+          GST_MAP_READ))
+    goto map_failed;
 
   data = dec->current_frame_map.data;
   nbytes = dec->current_frame_map.size;
-  has_eoi = ((data[nbytes - 2] != 0xff) || (data[nbytes - 1] != 0xd9));
+  if (nbytes < 2)
+    goto need_more_data;
+  has_eoi = ((data[nbytes - 2] == 0xff) && (data[nbytes - 1] == 0xd9));
 
   /* some cameras fail to send an end-of-image marker (EOI),
    * add it if that is the case. */
@@ -1250,6 +1268,7 @@ gst_jpeg_dec_handle_frame (GstVideoDecoder * bdec, GstVideoCodecFrame * frame)
   /* is it interlaced MJPEG? (we really don't want to scan the jpeg data
    * to see if there are two SOF markers in the packet to detect this) */
   if (gst_video_decoder_get_packetized (bdec) &&
+      dec->input_state &&
       dec->input_state->info.height > height &&
       dec->input_state->info.height <= (height * 2)
       && dec->input_state->info.width == width) {
@@ -1303,6 +1322,9 @@ gst_jpeg_dec_handle_frame (GstVideoDecoder * bdec, GstVideoCodecFrame * frame)
   /* decode second field if there is one */
   if (num_fields == 2) {
     GstVideoFormat field2_format;
+
+    /* Checked above before setting num_fields to 2 */
+    g_assert (dec->input_state != NULL);
 
     /* skip any chunk or padding bytes before the next SOI marker; both fields
      * are in one single buffer here, so direct access should be fine here */
@@ -1383,6 +1405,13 @@ need_more_data:
     goto exit;
   }
   /* ERRORS */
+map_failed:
+  {
+    GST_ELEMENT_ERROR (dec, RESOURCE, READ, (_("Failed to read memory")),
+        ("gst_buffer_map() failed for READ access"));
+    ret = GST_FLOW_ERROR;
+    goto exit;
+  }
 decode_error:
   {
     gchar err_msg[JMSG_LENGTH_MAX];
@@ -1550,6 +1579,10 @@ gst_jpeg_dec_stop (GstVideoDecoder * bdec)
   GstJpegDec *dec = (GstJpegDec *) bdec;
 
   gst_jpeg_dec_free_buffers (dec);
+
+  g_free (dec->scratch);
+  dec->scratch = NULL;
+  dec->scratch_size = 0;
 
   return TRUE;
 }

@@ -31,6 +31,7 @@
 
 #include <QtCore/QRunnable>
 #include <QtCore/QMutexLocker>
+#include <QtCore/QPointer>
 #include <QtGui/QGuiApplication>
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGSimpleTextureNode>
@@ -78,6 +79,14 @@ struct _QtGLVideoItemPrivate
   QOpenGLContext *qt_context;
   GstGLContext *other_context;
   GstGLContext *context;
+
+  /* buffers with textures that were bound by QML */
+  GQueue bound_buffers;
+  /* buffers that were previously bound but in the meantime a new one was
+   * bound so this one is most likely not used anymore
+   * FIXME: Ideally we would use fences for this but there seems to be no
+   * way to reliably "try wait" on a fence */
+  GQueue potentially_unbound_buffers;
 };
 
 class InitializeSceneGraph : public QRunnable
@@ -87,7 +96,7 @@ public:
   void run();
 
 private:
-  QtGLVideoItem *item_;
+  QPointer<QtGLVideoItem> item_;
 };
 
 InitializeSceneGraph::InitializeSceneGraph(QtGLVideoItem *item) :
@@ -97,12 +106,13 @@ InitializeSceneGraph::InitializeSceneGraph(QtGLVideoItem *item) :
 
 void InitializeSceneGraph::run()
 {
-  item_->onSceneGraphInitialized();
+  if(item_)
+    item_->onSceneGraphInitialized();
 }
 
 QtGLVideoItem::QtGLVideoItem()
 {
-  static volatile gsize _debug;
+  static gsize _debug;
 
   if (g_once_init_enter (&_debug)) {
     GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, "qtglwidget", 0, "Qt GL Widget");
@@ -119,7 +129,7 @@ QtGLVideoItem::QtGLVideoItem()
 
   g_mutex_init (&this->priv->lock);
 
-  this->priv->display = gst_qt_get_gl_display();
+  this->priv->display = gst_qt_get_gl_display(TRUE);
 
   connect(this, SIGNAL(windowChanged(QQuickWindow*)), this,
           SLOT(handleWindowChanged(QQuickWindow*)));
@@ -131,11 +141,13 @@ QtGLVideoItem::QtGLVideoItem()
 
 QtGLVideoItem::~QtGLVideoItem()
 {
+  GstBuffer *tmp_buffer;
+
   /* Before destroying the priv info, make sure
    * no qmlglsink's will call in again, and that
    * any ongoing calls are done by invalidating the proxy
    * pointer */
-  GST_INFO ("Destroying QtGLVideoItem and invalidating the proxy");
+  GST_INFO ("%p Destroying QtGLVideoItem and invalidating the proxy %p", this, proxy.data());
   proxy->invalidateRef();
   proxy.clear();
 
@@ -146,6 +158,19 @@ QtGLVideoItem::~QtGLVideoItem()
     gst_object_unref(this->priv->other_context);
   if (this->priv->display)
     gst_object_unref(this->priv->display);
+
+  while ((tmp_buffer = (GstBuffer*) g_queue_pop_head (&this->priv->potentially_unbound_buffers))) {
+    GST_TRACE ("old buffer %p should be unbound now, unreffing", tmp_buffer);
+    gst_buffer_unref (tmp_buffer);
+  }
+  while ((tmp_buffer = (GstBuffer*) g_queue_pop_head (&this->priv->bound_buffers))) {
+    GST_TRACE ("old buffer %p should be unbound now, unreffing", tmp_buffer);
+    gst_buffer_unref (tmp_buffer);
+  }
+
+  gst_buffer_replace (&this->priv->buffer, NULL);
+
+  gst_caps_replace (&this->priv->caps, NULL);
   g_free (this->priv);
   this->priv = NULL;
 }
@@ -170,6 +195,8 @@ void
 QtGLVideoItem::setForceAspectRatio(bool force_aspect_ratio)
 {
   this->priv->force_aspect_ratio = !!force_aspect_ratio;
+
+  emit forceAspectRatioChanged(force_aspect_ratio);
 }
 
 bool
@@ -188,6 +215,9 @@ QSGNode *
 QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
     UpdatePaintNodeData * updatePaintNodeData)
 {
+  GstBuffer *old_buffer;
+  gboolean was_bound = FALSE;
+
   if (!m_openGlContextInitialized) {
     return oldNode;
   }
@@ -197,7 +227,9 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
   GstQSGTexture *tex;
 
   g_mutex_lock (&this->priv->lock);
-  gst_gl_context_activate (this->priv->other_context, TRUE);
+
+  if (gst_gl_context_get_current() == NULL)
+    gst_gl_context_activate (this->priv->other_context, TRUE);
 
   GST_TRACE ("%p updatePaintNode", this);
 
@@ -213,6 +245,38 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
   }
 
   tex = static_cast<GstQSGTexture *> (texNode->texture());
+
+  if ((old_buffer = tex->getBuffer(&was_bound))) {
+    if (old_buffer == this->priv->buffer) {
+      /* same buffer */
+      gst_buffer_unref (old_buffer);
+    } else if (!was_bound) {
+      GST_TRACE ("old buffer %p was not bound yet, unreffing", old_buffer);
+      gst_buffer_unref (old_buffer);
+    } else {
+      GstBuffer *tmp_buffer;
+
+      GST_TRACE ("old buffer %p was bound, queueing up for later", old_buffer);
+      /* Unref all buffers that were previously not bound anymore. At least
+       * one more buffer was bound in the meantime so this one is most likely
+       * not in use anymore. */
+      while ((tmp_buffer = (GstBuffer*) g_queue_pop_head (&this->priv->potentially_unbound_buffers))) {
+        GST_TRACE ("old buffer %p should be unbound now, unreffing", tmp_buffer);
+        gst_buffer_unref (tmp_buffer);
+      }
+
+      /* Move previous bound buffers to the next queue. We now know that
+       * another buffer was bound in the meantime and will free them on
+       * the next iteration above. */
+      while ((tmp_buffer = (GstBuffer*) g_queue_pop_head (&this->priv->bound_buffers))) {
+        GST_TRACE ("old buffer %p is potentially unbound now", tmp_buffer);
+        g_queue_push_tail (&this->priv->potentially_unbound_buffers, tmp_buffer);
+      }
+      g_queue_push_tail (&this->priv->bound_buffers, old_buffer);
+    }
+    old_buffer = NULL;
+  }
+
   tex->setCaps (this->priv->caps);
   tex->setBuffer (this->priv->buffer);
   texNode->markDirty(QSGNode::DirtyMaterial);
@@ -236,7 +300,6 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
 
   texNode->setRect (QRectF (result.x, result.y, result.w, result.h));
 
-  gst_gl_context_activate (this->priv->other_context, FALSE);
   g_mutex_unlock (&this->priv->lock);
 
   return texNode;
@@ -245,12 +308,23 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
 static void
 _reset (QtGLVideoItem * qt_item)
 {
+  GstBuffer *tmp_buffer;
+
   gst_buffer_replace (&qt_item->priv->buffer, NULL);
 
   gst_caps_replace (&qt_item->priv->caps, NULL);
 
   qt_item->priv->negotiated = FALSE;
   qt_item->priv->initted = FALSE;
+
+  while ((tmp_buffer = (GstBuffer*) g_queue_pop_head (&qt_item->priv->potentially_unbound_buffers))) {
+    GST_TRACE ("old buffer %p should be unbound now, unreffing", tmp_buffer);
+    gst_buffer_unref (tmp_buffer);
+  }
+  while ((tmp_buffer = (GstBuffer*) g_queue_pop_head (&qt_item->priv->bound_buffers))) {
+    GST_TRACE ("old buffer %p should be unbound now, unreffing", tmp_buffer);
+    gst_buffer_unref (tmp_buffer);
+  }
 }
 
 void
@@ -258,11 +332,13 @@ QtGLVideoItemInterface::setBuffer (GstBuffer * buffer)
 {
   QMutexLocker locker(&lock);
 
-  if (qt_item == NULL)
+  if (qt_item == NULL) {
+    GST_WARNING ("%p actual item is NULL. setBuffer call ignored", this);
     return;
+  }
 
   if (!qt_item->priv->negotiated) {
-    GST_WARNING ("Got buffer on unnegotiated QtGLVideoItem. Dropping");
+    GST_WARNING ("%p Got buffer on unnegotiated QtGLVideoItem. Dropping", this);
     return;
   }
 
@@ -278,7 +354,10 @@ QtGLVideoItemInterface::setBuffer (GstBuffer * buffer)
 void
 QtGLVideoItem::onSceneGraphInitialized ()
 {
-  GST_DEBUG ("scene graph initialization with Qt GL context %p",
+  if (this->window() == NULL)
+    return;
+
+  GST_DEBUG ("%p scene graph initialization with Qt GL context %p", this,
       this->window()->openglContext ());
 
   if (this->priv->qt_context == this->window()->openglContext ())
@@ -305,6 +384,10 @@ QtGLVideoItem::onSceneGraphInvalidated ()
   GST_FIXME ("%p scene graph invalidated", this);
 }
 
+/**
+ * Retrieve and populate the GL context information from the current
+ * OpenGL context.
+ */
 gboolean
 QtGLVideoItemInterface::initWinSys ()
 {
@@ -405,27 +488,31 @@ _calculate_par (QtGLVideoItem * widget, GstVideoInfo * info)
   if (!ok)
     return FALSE;
 
-  GST_LOG ("PAR: %u/%u DAR:%u/%u", par_n, par_d, display_par_n, display_par_d);
+  widget->setImplicitWidth (width);
+  widget->setImplicitHeight (height);
+
+  GST_LOG ("%p PAR: %u/%u DAR:%u/%u", widget, par_n, par_d, display_par_n,
+      display_par_d);
 
   if (height % display_ratio_den == 0) {
-    GST_DEBUG ("keeping video height");
+    GST_DEBUG ("%p keeping video height", widget);
     widget->priv->display_width = (guint)
         gst_util_uint64_scale_int (height, display_ratio_num,
         display_ratio_den);
     widget->priv->display_height = height;
   } else if (width % display_ratio_num == 0) {
-    GST_DEBUG ("keeping video width");
+    GST_DEBUG ("%p keeping video width", widget);
     widget->priv->display_width = width;
     widget->priv->display_height = (guint)
         gst_util_uint64_scale_int (width, display_ratio_den, display_ratio_num);
   } else {
-    GST_DEBUG ("approximating while keeping video height");
+    GST_DEBUG ("%p approximating while keeping video height", widget);
     widget->priv->display_width = (guint)
         gst_util_uint64_scale_int (height, display_ratio_num,
         display_ratio_den);
     widget->priv->display_height = height;
   }
-  GST_DEBUG ("scaling to %dx%d", widget->priv->display_width,
+  GST_DEBUG ("%p scaling to %dx%d", widget, widget->priv->display_width,
       widget->priv->display_height);
 
   return TRUE;
@@ -491,7 +578,7 @@ QtGLVideoItemInterface::getContext ()
 }
 
 GstGLDisplay *
-QtGLVideoItemInterface::getDisplay() 
+QtGLVideoItemInterface::getDisplay()
 {
   QMutexLocker locker(&lock);
 

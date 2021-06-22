@@ -56,6 +56,7 @@ struct _GstRtpGSTPay
   GstTagList *taglist;
   guint config_interval;
   GstClockTime last_config;
+  gboolean force_config;
 };
 
 struct _GstRtpGSTPayClass
@@ -64,8 +65,6 @@ struct _GstRtpGSTPayClass
 };
 
 GType gst_rtp_gst_pay_get_type (void);
-
-gboolean gst_rtp_gst_pay_plugin_init (GstPlugin * plugin);
 
 G_END_DECLS
 

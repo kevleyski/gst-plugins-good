@@ -1,4 +1,5 @@
 pulse_sources = [
+  'gstpulseelement.c',
   'plugin.c',
   'pulsesink.c',
   'pulsesrc.c',
@@ -6,7 +7,7 @@ pulse_sources = [
   'pulseutil.c',
 ]
 
-libpulse_dep = dependency('libpulse', version : '>=2.0', required : false)
+libpulse_dep = dependency('libpulse', version : '>=2.0', required : get_option('pulse'))
 
 if libpulse_dep.found()
   gstpulse = library('gstpulseaudio',
@@ -18,4 +19,5 @@ if libpulse_dep.found()
     install_dir : plugins_install_dir,
   )
   pkgconfig.generate(gstpulse, install_dir : plugins_pkgconfig_install_dir)
+  plugins += [gstpulse]
 endif

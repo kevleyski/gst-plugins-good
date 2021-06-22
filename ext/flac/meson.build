@@ -1,11 +1,12 @@
 flac_sources = [
   'gstflac.c',
+  'gstflacelement.c',
   'gstflacdec.c',
   'gstflacenc.c',
   'gstflactag.c',
 ]
 
-flac_dep = dependency('flac', version : '>=1.1.4', required : false)
+flac_dep = dependency('flac', version : '>=1.1.4', required : get_option('flac'))
 
 if flac_dep.found()
   gstflac = library('gstflac',
@@ -18,4 +19,5 @@ if flac_dep.found()
     install_dir : plugins_install_dir,
   )
   pkgconfig.generate(gstflac, install_dir : plugins_pkgconfig_install_dir)
+  plugins += [gstflac]
 endif

@@ -2,6 +2,7 @@ soup_sources = [
   'gstsouphttpsrc.c',
   'gstsouphttpclientsink.c',
   'gstsouputils.c',
+  'gstsoupelement.c',
   'gstsoup.c',
 ]
 
@@ -10,7 +11,8 @@ soup_args = [
   '-DSOUP_VERSION_MAX_ALLOWED=SOUP_DEPRECATED_IN_2_48',
 ]
 
-libsoup_dep = dependency('libsoup-2.4', version : '>=2.48', required : false)
+libsoup_dep = dependency('libsoup-2.4', version : '>=2.48', required : get_option('soup'),
+  fallback : ['libsoup', 'libsoup_dep'])
 
 if libsoup_dep.found()
   gstsouphttpsrc = library('gstsoup',
@@ -23,4 +25,5 @@ if libsoup_dep.found()
     install_dir : plugins_install_dir,
   )
   pkgconfig.generate(gstsouphttpsrc, install_dir : plugins_pkgconfig_install_dir)
+  plugins += [gstsouphttpsrc]
 endif

@@ -19,21 +19,22 @@
 
 /**
  * SECTION:element-flvdemux
+ * @title: flvdemux
  *
  * flvdemux demuxes an FLV file into the different contained streams.
  *
- * <refsect2>
- * <title>Example launch line</title>
+ * ## Example launch line
  * |[
  * gst-launch-1.0 -v filesrc location=/path/to/flv ! flvdemux ! audioconvert ! autoaudiosink
  * ]| This pipeline demuxes an FLV file and outputs the contained raw audio streams.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
+#include "gstflvelements.h"
 #include "gstflvdemux.h"
 #include "gstflvmux.h"
 
@@ -70,8 +71,8 @@ static GstStaticPadTemplate audio_src_template =
         "audio/mpeg, mpegversion = (int) 4, stream-format = (string) raw, framed = (boolean) TRUE; "
         "audio/x-nellymoser, channels = (int) { 1, 2 }, rate = (int) { 5512, 8000, 11025, 16000, 22050, 44100 }; "
         "audio/x-raw, format = (string) { U8, S16LE }, layout = (string) interleaved, channels = (int) { 1, 2 }, rate = (int) { 5512, 11025, 22050, 44100 }; "
-        "audio/x-alaw, channels = (int) { 1, 2 }, rate = (int) { 5512, 11025, 22050, 44100 }; "
-        "audio/x-mulaw, channels = (int) { 1, 2 }, rate = (int) { 5512, 11025, 22050, 44100 }; "
+        "audio/x-alaw, channels = (int) { 1, 2 }, rate = (int) 8000; "
+        "audio/x-mulaw, channels = (int) { 1, 2 }, rate = (int) 8000; "
         "audio/x-speex, channels = (int) 1, rate = (int) 16000;")
     );
 
@@ -85,11 +86,10 @@ static GstStaticPadTemplate video_src_template =
         "video/x-h264, stream-format=avc;")
     );
 
-GST_DEBUG_CATEGORY_STATIC (flvdemux_debug);
-#define GST_CAT_DEFAULT flvdemux_debug
-
 #define gst_flv_demux_parent_class parent_class
 G_DEFINE_TYPE (GstFlvDemux, gst_flv_demux, GST_TYPE_ELEMENT);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (flvdemux, "flvdemux",
+    GST_RANK_PRIMARY, GST_TYPE_FLV_DEMUX, flv_element_init (plugin));
 
 /* 9 bytes of header + 4 bytes of first previous tag size */
 #define FLV_HEADER_SIZE 13
@@ -107,6 +107,8 @@ static gboolean flv_demux_handle_seek_push (GstFlvDemux * demux,
 static gboolean gst_flv_demux_handle_seek_pull (GstFlvDemux * demux,
     GstEvent * event, gboolean seeking);
 
+static gboolean gst_flv_demux_sink_query (GstPad * pad, GstObject * parent,
+    GstQuery * query);
 static gboolean gst_flv_demux_query (GstPad * pad, GstObject * parent,
     GstQuery * query);
 static gboolean gst_flv_demux_src_event (GstPad * pad, GstObject * parent,
@@ -202,7 +204,8 @@ FLV_GET_STRING (GstByteReader * reader)
   }
 
   memcpy (string, str, string_size);
-  if (!g_utf8_validate (string, string_size, NULL)) {
+  /* Check utf-8 validity if it's not an empty string */
+  if (string[0] && !g_utf8_validate (string, string_size, NULL)) {
     g_free (string);
     return NULL;
   }
@@ -371,11 +374,13 @@ gst_flv_demux_parse_metadata_item (GstFlvDemux * demux, GstByteReader * reader,
       } else if (!strcmp (tag_name, "framerate")) {
         demux->framerate = d;
       } else if (!strcmp (tag_name, "audiodatarate")) {
+        demux->audio_bitrate = (guint) (d * 1024);
         gst_tag_list_add (demux->audio_tags, GST_TAG_MERGE_REPLACE,
-            GST_TAG_NOMINAL_BITRATE, (guint) (d * 1024), NULL);
+            GST_TAG_NOMINAL_BITRATE, demux->audio_bitrate, NULL);
       } else if (!strcmp (tag_name, "videodatarate")) {
+        demux->video_bitrate = (guint) (d * 1024);
         gst_tag_list_add (demux->video_tags, GST_TAG_MERGE_REPLACE,
-            GST_TAG_NOMINAL_BITRATE, (guint) (d * 1024), NULL);
+            GST_TAG_NOMINAL_BITRATE, demux->video_bitrate, NULL);
       } else {
         GST_INFO_OBJECT (demux, "Tag \'%s\' not handled", tag_name);
       }
@@ -402,6 +407,11 @@ gst_flv_demux_parse_metadata_item (GstFlvDemux * demux, GstByteReader * reader,
       s = FLV_GET_STRING (reader);
       if (s == NULL)
         goto error;
+      if (!strcmp (s, "")) {
+        /* Not strictly an error, just an empty string */
+        g_free (s);
+        break;
+      }
 
       GST_DEBUG_OBJECT (demux, "%s => (string) %s", tag_name, s);
 
@@ -422,7 +432,8 @@ gst_flv_demux_parse_metadata_item (GstFlvDemux * demux, GstByteReader * reader,
       } else if (!strcmp (tag_name, "title")) {
         gst_tag_list_add (demux->taglist, GST_TAG_MERGE_REPLACE,
             GST_TAG_TITLE, s, NULL);
-      } else if (!strcmp (tag_name, "metadatacreator")) {
+      } else if (!strcmp (tag_name, "metadatacreator")
+          || !strcmp (tag_name, "encoder")) {
         gst_tag_list_add (demux->taglist, GST_TAG_MERGE_REPLACE,
             GST_TAG_ENCODER, s, NULL);
       } else {
@@ -723,6 +734,7 @@ gst_flv_demux_audio_negotiate (GstFlvDemux * demux, guint32 codec_tag,
   GstCaps *caps = NULL, *old_caps;
   gboolean ret = FALSE;
   guint adjusted_rate = rate;
+  guint adjusted_channels = channels;
   GstEvent *event;
   gchar *stream_id;
 
@@ -783,6 +795,16 @@ gst_flv_demux_audio_negotiate (GstFlvDemux * demux, guint32 codec_tag,
               adjusted_rate);
         } else {
           adjusted_rate = rate;
+        }
+
+        adjusted_channels =
+            gst_codec_utils_aac_get_channels (map.data, map.size);
+
+        if (adjusted_channels && (channels != adjusted_channels)) {
+          GST_LOG_OBJECT (demux, "Ajusting AAC channels %d -> %d", channels,
+              adjusted_channels);
+        } else {
+          adjusted_channels = channels;
         }
       }
       gst_buffer_unmap (demux->audio_codec_data, &map);
@@ -866,7 +888,7 @@ gst_flv_demux_audio_negotiate (GstFlvDemux * demux, guint32 codec_tag,
   }
 
   gst_caps_set_simple (caps, "rate", G_TYPE_INT, adjusted_rate,
-      "channels", G_TYPE_INT, channels, NULL);
+      "channels", G_TYPE_INT, adjusted_channels, NULL);
 
   if (demux->audio_codec_data) {
     gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER,
@@ -991,7 +1013,7 @@ gst_flv_demux_update_resync (GstFlvDemux * demux, guint32 dts, gboolean discont,
   gboolean ret = FALSE;
   gint32 ddts = dts - *last;
   if (!discont && ddts <= -RESYNC_THRESHOLD) {
-    /* Theoretically, we should use substract the duration of the last buffer,
+    /* Theoretically, we should use subtract the duration of the last buffer,
        but this demuxer sends no durations on buffers, not sure if it cannot
        know, or just does not care to calculate. */
     *offset -= ddts * GST_MSECOND;
@@ -1004,6 +1026,51 @@ gst_flv_demux_update_resync (GstFlvDemux * demux, guint32 dts, gboolean discont,
   *last = dts;
 
   return ret;
+}
+
+static void
+gst_flv_demux_sync_streams (GstFlvDemux * demux)
+{
+  /* Check if the audio or video stream are more than 3s behind the other
+   * stream, and if so send a gap event accordingly */
+
+  if (demux->audio_pad && GST_CLOCK_TIME_IS_VALID (demux->segment.position) &&
+      demux->last_audio_pts * GST_MSECOND + demux->audio_time_offset +
+      3 * GST_SECOND < demux->segment.position) {
+    GstEvent *event;
+    guint64 start =
+        demux->last_audio_pts * GST_MSECOND + demux->audio_time_offset;
+    guint64 stop = demux->segment.position - 3 * GST_SECOND;
+
+    GST_DEBUG_OBJECT (demux,
+        "Synchronizing audio stream with video stream by advancing time from %"
+        GST_TIME_FORMAT " to %" GST_TIME_FORMAT, GST_TIME_ARGS (start),
+        GST_TIME_ARGS (stop));
+
+    demux->last_audio_pts = (stop - demux->audio_time_offset) / GST_MSECOND;
+
+    event = gst_event_new_gap (start, stop - start);
+    gst_pad_push_event (demux->audio_pad, event);
+  }
+
+  if (demux->video_pad && GST_CLOCK_TIME_IS_VALID (demux->segment.position) &&
+      demux->last_video_dts * GST_MSECOND + demux->video_time_offset +
+      3 * GST_SECOND < demux->segment.position) {
+    GstEvent *event;
+    guint64 start =
+        demux->last_video_dts * GST_MSECOND + demux->video_time_offset;
+    guint64 stop = demux->segment.position - 3 * GST_SECOND;
+
+    GST_DEBUG_OBJECT (demux,
+        "Synchronizing video stream with audio stream by advancing time from %"
+        GST_TIME_FORMAT " to %" GST_TIME_FORMAT, GST_TIME_ARGS (start),
+        GST_TIME_ARGS (stop));
+
+    demux->last_video_dts = (stop - demux->video_time_offset) / GST_MSECOND;
+
+    event = gst_event_new_gap (start, stop - start);
+    gst_pad_push_event (demux->video_pad, event);
+  }
 }
 
 static GstFlowReturn
@@ -1085,7 +1152,7 @@ gst_flv_demux_parse_tag_audio (GstFlvDemux * demux, GstBuffer * buffer)
   }
 
   /* codec tags with special rates */
-  if (codec_tag == 5 || codec_tag == 14)
+  if (codec_tag == 5 || codec_tag == 14 || codec_tag == 7 || codec_tag == 8)
     rate = 8000;
   else if ((codec_tag == 4) || (codec_tag == 11))
     rate = 16000;
@@ -1302,6 +1369,10 @@ gst_flv_demux_parse_tag_audio (GstFlvDemux * demux, GstBuffer * buffer)
 
   ret = gst_flow_combiner_update_pad_flow (demux->flowcombiner,
       demux->audio_pad, ret);
+
+  if (ret == GST_FLOW_OK) {
+    gst_flv_demux_sync_streams (demux);
+  }
 
 beach:
   gst_buffer_unmap (buffer, &map);
@@ -1619,7 +1690,8 @@ gst_flv_demux_parse_tag_video (GstFlvDemux * demux, GstBuffer * buffer)
   /* Check if caps have changed */
   if (G_UNLIKELY (codec_tag != demux->video_codec_tag || demux->got_par)) {
     GST_DEBUG_OBJECT (demux, "video settings have changed, changing caps");
-    gst_buffer_replace (&demux->video_codec_data, NULL);
+    if (codec_tag != demux->video_codec_tag)
+      gst_buffer_replace (&demux->video_codec_data, NULL);
 
     if (!gst_flv_demux_video_negotiate (demux, codec_tag)) {
       ret = GST_FLOW_ERROR;
@@ -1736,6 +1808,10 @@ gst_flv_demux_parse_tag_video (GstFlvDemux * demux, GstBuffer * buffer)
 
   ret = gst_flow_combiner_update_pad_flow (demux->flowcombiner,
       demux->video_pad, ret);
+
+  if (ret == GST_FLOW_OK) {
+    gst_flv_demux_sync_streams (demux);
+  }
 
 beach:
   gst_buffer_unmap (buffer, &map);
@@ -2035,6 +2111,9 @@ gst_flv_demux_cleanup (GstFlvDemux * demux)
     g_array_free (demux->filepositions, TRUE);
     demux->filepositions = NULL;
   }
+
+  demux->video_bitrate = 0;
+  demux->audio_bitrate = 0;
 
   gst_flv_demux_clear_tags (demux);
 }
@@ -2675,7 +2754,8 @@ gst_flv_demux_loop (GstPad * pad)
   }
 
   /* pause if something went wrong or at end */
-  if (G_UNLIKELY (ret != GST_FLOW_OK))
+  if (G_UNLIKELY (ret != GST_FLOW_OK) && !(ret == GST_FLOW_NOT_LINKED
+          && !demux->no_more_pads))
     goto pause;
 
   gst_object_unref (demux);
@@ -3034,7 +3114,7 @@ gst_flv_demux_handle_seek_pull (GstFlvDemux * demux, GstEvent * event,
       demux->seek_event = gst_event_ref (event);
       demux->seek_time = seeksegment.position;
       demux->state = FLV_STATE_SEEK;
-      /* do not know about succes yet, but we did care and handled it */
+      /* do not know about success yet, but we did care and handled it */
       ret = TRUE;
       goto exit;
     }
@@ -3110,7 +3190,7 @@ wrong_format:
   }
 }
 
-/* If we can pull that's prefered */
+/* If we can pull that's preferred */
 static gboolean
 gst_flv_demux_sink_activate (GstPad * sinkpad, GstObject * parent)
 {
@@ -3256,6 +3336,54 @@ gst_flv_demux_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
     }
     default:
       ret = gst_pad_event_default (pad, parent, event);
+      break;
+  }
+
+  return ret;
+}
+
+static gboolean
+gst_flv_demux_sink_query (GstPad * pad, GstObject * parent, GstQuery * query)
+{
+  GstFlvDemux *demux;
+  gboolean ret = FALSE;
+
+  demux = GST_FLV_DEMUX (parent);
+
+  switch (GST_QUERY_TYPE (query)) {
+    case GST_QUERY_BITRATE:
+    {
+      guint total_bitrate = 0;
+
+      if (demux->audio_pad) {
+        if (!demux->audio_bitrate) {
+          GST_DEBUG_OBJECT (demux,
+              "Have audio pad but no audio bitrate, can't answer BITRATE query");
+          break;
+        }
+        total_bitrate = demux->audio_bitrate;
+      }
+      if (demux->video_pad) {
+        if (!demux->video_bitrate) {
+          GST_DEBUG_OBJECT (demux,
+              "Have video pad but no video bitrate, can't answer BITRATE query");
+          break;
+        }
+        total_bitrate += demux->video_bitrate;
+      }
+
+      GST_DEBUG_OBJECT (demux,
+          "bitrate query. total_bitrate:%" G_GUINT32_FORMAT, total_bitrate);
+
+      if (total_bitrate) {
+        /* Padding of 2kbit/s for container overhead */
+        gst_query_set_bitrate (query, total_bitrate + 2048);
+        ret = TRUE;
+      }
+      break;
+    }
+    default:
+      ret = gst_pad_query_default (pad, parent, query);
       break;
   }
 
@@ -3626,7 +3754,7 @@ gst_flv_demux_init (GstFlvDemux * demux)
 {
   demux->sinkpad =
       gst_pad_new_from_static_template (&flv_sink_template, "sink");
-
+  GST_PAD_SET_ACCEPT_TEMPLATE (demux->sinkpad);
   gst_pad_set_event_function (demux->sinkpad,
       GST_DEBUG_FUNCPTR (gst_flv_demux_sink_event));
   gst_pad_set_chain_function (demux->sinkpad,
@@ -3635,6 +3763,8 @@ gst_flv_demux_init (GstFlvDemux * demux)
       GST_DEBUG_FUNCPTR (gst_flv_demux_sink_activate));
   gst_pad_set_activatemode_function (demux->sinkpad,
       GST_DEBUG_FUNCPTR (gst_flv_demux_sink_activate_mode));
+  gst_pad_set_query_function (demux->sinkpad,
+      GST_DEBUG_FUNCPTR (gst_flv_demux_sink_query));
 
   gst_element_add_pad (GST_ELEMENT (demux), demux->sinkpad);
 
@@ -3647,21 +3777,3 @@ gst_flv_demux_init (GstFlvDemux * demux)
 
   gst_flv_demux_cleanup (demux);
 }
-
-static gboolean
-plugin_init (GstPlugin * plugin)
-{
-  GST_DEBUG_CATEGORY_INIT (flvdemux_debug, "flvdemux", 0, "FLV demuxer");
-
-  if (!gst_element_register (plugin, "flvdemux", GST_RANK_PRIMARY,
-          gst_flv_demux_get_type ()) ||
-      !gst_element_register (plugin, "flvmux", GST_RANK_PRIMARY,
-          gst_flv_mux_get_type ()))
-    return FALSE;
-
-  return TRUE;
-}
-
-GST_PLUGIN_DEFINE (GST_VERSION_MAJOR, GST_VERSION_MINOR,
-    flv, "FLV muxing and demuxing plugin",
-    plugin_init, VERSION, "LGPL", GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)

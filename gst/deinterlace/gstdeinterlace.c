@@ -22,16 +22,16 @@
 
 /**
  * SECTION:element-deinterlace
+ * @title: deinterlace
  *
  * deinterlace deinterlaces interlaced video frames to progressive video frames.
  * For this different algorithms can be selected which will be described later.
  *
- * <refsect2>
- * <title>Example launch line</title>
+ * ## Example launch line
  * |[
  * gst-launch-1.0 -v filesrc location=/path/to/file ! decodebin ! videoconvert ! deinterlace ! videoconvert ! autovideosink
  * ]| This pipeline deinterlaces a video file with the default deinterlacing options.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -40,6 +40,7 @@
 
 #include "gstdeinterlace.h"
 #include "tvtime/plugins.h"
+#include "yadif.h"
 
 #include <string.h>
 
@@ -72,12 +73,25 @@ enum
   PROP_DROP_ORPHANS
 };
 
+/* P is progressive, meaning the top and bottom fields belong to
+ * the same frame, i.e. they were sampled at the same time */
 #define GST_DEINTERLACE_BUFFER_STATE_P    (1<<0)
+/* I is interlaced meaning that the two fields were sampled at
+ * different times, usually equidistant in time so one at 1/60,
+ * the other at 2/60 */
 #define GST_DEINTERLACE_BUFFER_STATE_I    (1<<1)
+/* TC is telecine, B means bottom, T means top */
 #define GST_DEINTERLACE_BUFFER_STATE_TC_B (1<<2)
 #define GST_DEINTERLACE_BUFFER_STATE_TC_T (1<<3)
+/* TC_P means telecine progressive meaning that the two fields
+ * in the frame were sampled at the same time */
 #define GST_DEINTERLACE_BUFFER_STATE_TC_P (1<<4)
+/* TC_M i think means telecine mixed, meaning that the two fields
+ * are sampled at different times so you need to find the other field
+ * in the previous or next frame */
 #define GST_DEINTERLACE_BUFFER_STATE_TC_M (1<<5)
+/* RFF means repeat field flag and indicates a field that has
+ * previously been seen */
 #define GST_DEINTERLACE_BUFFER_STATE_RFF  (1<<6)
 
 #define GST_ONE \
@@ -157,6 +171,7 @@ static const GEnumValue methods_types[] = {
       "weavetff"},
   {GST_DEINTERLACE_WEAVE_BFF, "Progressive: Bottom Field First (Do Not Use)",
       "weavebff"},
+  {GST_DEINTERLACE_YADIF, "YADIF Adaptive Deinterlacer", "yadif"},
   {0, NULL, NULL},
 };
 
@@ -301,7 +316,7 @@ static void gst_deinterlace_get_property (GObject * self, guint prop_id,
 static GstCaps *gst_deinterlace_getcaps (GstDeinterlace * self, GstPad * pad,
     GstCaps * filter);
 static gboolean gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad,
-    GstCaps * caps);
+    GstCaps * caps, gboolean force);
 static gboolean gst_deinterlace_sink_event (GstPad * pad, GstObject * parent,
     GstEvent * event);
 static gboolean gst_deinterlace_sink_query (GstPad * pad, GstObject * parent,
@@ -327,6 +342,7 @@ static void gst_deinterlace_update_qos (GstDeinterlace * self,
 static void gst_deinterlace_reset_qos (GstDeinterlace * self);
 static void gst_deinterlace_read_qos (GstDeinterlace * self,
     gdouble * proportion, GstClockTime * time);
+static gboolean deinterlace_element_init (GstPlugin * plugin);
 
 #define IS_TELECINE(m) ((m) == GST_VIDEO_INTERLACE_MODE_MIXED && self->pattern > 1)
 
@@ -350,9 +366,9 @@ _do_init (GType object_type)
 }
 #endif
 
-G_DEFINE_TYPE (GstDeinterlace, gst_deinterlace, GST_TYPE_ELEMENT);
-
 #define parent_class gst_deinterlace_parent_class
+G_DEFINE_TYPE (GstDeinterlace, gst_deinterlace, GST_TYPE_ELEMENT);
+GST_ELEMENT_REGISTER_DEFINE_CUSTOM (deinterlace, deinterlace_element_init);
 
 static const struct
 {
@@ -368,7 +384,8 @@ static const struct
   gst_deinterlace_method_scaler_bob_get_type}, {
   gst_deinterlace_method_weave_get_type}, {
   gst_deinterlace_method_weave_tff_get_type}, {
-  gst_deinterlace_method_weave_bff_get_type}
+  gst_deinterlace_method_weave_bff_get_type}, {
+  gst_deinterlace_method_yadif_get_type}
 };
 
 static void
@@ -394,9 +411,9 @@ gst_deinterlace_set_method (GstDeinterlace * self, GstDeinterlaceMethods method)
 #if 0
     gst_child_proxy_child_removed (GST_OBJECT (self),
         GST_OBJECT (self->method));
+#endif
     gst_object_unparent (GST_OBJECT (self->method));
     self->method = NULL;
-#endif
   }
 
   method_type =
@@ -524,71 +541,21 @@ gst_deinterlace_class_init (GstDeinterlaceClass * klass)
    *
    * Some methods provide parameters which can be set by getting
    * the "method" child via the #GstChildProxy interface and
-   * setting the appropiate properties on it.
+   * setting the appropriate properties on it.
    *
-   * <itemizedlist>
-   * <listitem>
-   * <para>
-   * tomsmocomp
-   * Motion Adaptive: Motion Search
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * greedyh
-   * Motion Adaptive: Advanced Detection
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * greedyl
-   * Motion Adaptive: Simple Detection
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * vfir
-   * Blur vertical
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * linear
-   * Linear interpolation
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * linearblend
-   * Linear interpolation in time domain.  Any motion causes significant
-   * ghosting, so this method should not be used.
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * scalerbob
-   * Double lines
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * weave
-   * Weave.  Bad quality, do not use.
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * weavetff
-   * Progressive: Top Field First.  Bad quality, do not use.
-   * </para>
-   * </listitem>
-   * <listitem>
-   * <para>
-   * weavebff
-   * Progressive: Bottom Field First.  Bad quality, do not use.
-   * </para>
-   * </listitem>
-   * </itemizedlist>
+   * * tomsmocomp  Motion Adaptive: Motion Search
+   * * greedyh Motion Adaptive: Advanced Detection
+   * * greedyl Motion Adaptive: Simple Detection
+   * * vfir Blur vertical
+   * * linear Linear interpolation
+   * * linearblend Linear interpolation in time domain.
+   *   Any motion causes significant ghosting, so this
+   *   method should not be used.
+   * * scalerbob Double lines
+   * * weave Weave. Bad quality, do not use.
+   * * weavetff Progressive: Top Field First.  Bad quality, do not use.
+   * * weavebff Progressive: Bottom Field First.  Bad quality, do not use.
+   * * yadif YADIF Adaptive.
    */
   g_object_class_install_property (gobject_class, PROP_METHOD,
       g_param_spec_enum ("method",
@@ -664,6 +631,12 @@ gst_deinterlace_class_init (GstDeinterlaceClass * klass)
 
   element_class->change_state =
       GST_DEBUG_FUNCPTR (gst_deinterlace_change_state);
+
+  gst_type_mark_as_plugin_api (GST_TYPE_DEINTERLACE_METHODS, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_DEINTERLACE_FIELDS, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_DEINTERLACE_FIELD_LAYOUT, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_DEINTERLACE_MODES, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_DEINTERLACE_LOCKING, 0);
 }
 
 #if 0
@@ -719,6 +692,7 @@ gst_deinterlace_init (GstDeinterlace * self)
   self->mode = DEFAULT_MODE;
   self->user_set_method_id = DEFAULT_METHOD;
   gst_video_info_init (&self->vinfo);
+  gst_video_info_init (&self->vinfo_out);
   gst_deinterlace_set_method (self, self->user_set_method_id);
   self->fields = DEFAULT_FIELDS;
   self->user_set_fields = DEFAULT_FIELDS;
@@ -735,6 +709,7 @@ gst_deinterlace_init (GstDeinterlace * self)
   self->pattern_base_ts = GST_CLOCK_TIME_NONE;
   self->pattern_buf_dur = GST_CLOCK_TIME_NONE;
   self->still_frame_mode = FALSE;
+  self->telecine_tc_warned = FALSE;
 
   gst_deinterlace_reset (self);
 }
@@ -757,6 +732,77 @@ gst_video_frame_unmap_and_free (GstVideoFrame * frame)
 {
   gst_video_frame_unmap (frame);
   g_free (frame);
+}
+
+static GstVideoFrame *
+gst_deinterlace_pop_history (GstDeinterlace * self)
+{
+  GstVideoFrame *frame;
+
+  g_return_val_if_fail (self->history_count > 0, NULL);
+
+  GST_DEBUG_OBJECT (self, "Pop last history frame -- current history size %d",
+      self->history_count);
+
+  frame = self->field_history[self->history_count - 1].frame;
+
+  self->history_count--;
+  if (self->locking != GST_DEINTERLACE_LOCKING_NONE && (!self->history_count
+          || GST_VIDEO_FRAME_PLANE_DATA (frame, 0) !=
+          GST_VIDEO_FRAME_PLANE_DATA (self->field_history[self->history_count -
+                  1].frame, 0))) {
+    if (!self->low_latency)
+      self->state_count--;
+    if (self->pattern_lock) {
+      self->pattern_count++;
+      if (self->pattern != -1
+          && self->pattern_count >= telecine_patterns[self->pattern].length) {
+        self->pattern_count = 0;
+        self->output_count = 0;
+      }
+    }
+  }
+
+  GST_DEBUG_OBJECT (self, "Returning frame: %p %" GST_TIME_FORMAT
+      " with duration %" GST_TIME_FORMAT " and size %" G_GSIZE_FORMAT, frame,
+      GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (frame->buffer)),
+      GST_TIME_ARGS (GST_BUFFER_DURATION (frame->buffer)),
+      GST_VIDEO_FRAME_SIZE (frame));
+
+  return frame;
+}
+
+static void
+gst_deinterlace_delete_meta_at (GstDeinterlace * self, gint idx)
+{
+  if (self->field_history[idx].frame) {
+    if (self->field_history[idx].tc) {
+      gst_video_time_code_free (self->field_history[idx].tc);
+      self->field_history[idx].tc = NULL;
+    }
+    if (self->field_history[idx].caption) {
+      g_free (self->field_history[idx].caption->data);
+      g_free (self->field_history[idx].caption);
+      self->field_history[idx].caption = NULL;
+    }
+  }
+}
+
+static void
+gst_deinterlace_pop_and_clear (GstDeinterlace * self)
+{
+  gint idx;
+
+  if (self->history_count <= 0)
+    return;
+
+  idx = self->history_count - 1;
+  gst_deinterlace_delete_meta_at (self, idx);
+
+  /* FIXME: pop_history should return a structure with the frame and its meta.
+   * Currently we're just doing guesswork with the indices. Maybe just
+   * refactor the history functionality to make something clearer */
+  gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
 }
 
 static void
@@ -782,6 +828,7 @@ gst_deinterlace_reset_history (GstDeinterlace * self, gboolean drop_all)
       if (self->field_history[i].frame) {
         gst_video_frame_unmap_and_free (self->field_history[i].frame);
         self->field_history[i].frame = NULL;
+        gst_deinterlace_delete_meta_at (self, i);
       }
     }
   }
@@ -808,6 +855,7 @@ gst_deinterlace_reset (GstDeinterlace * self)
   GST_DEBUG_OBJECT (self, "Resetting internal state");
 
   gst_video_info_init (&self->vinfo);
+  gst_video_info_init (&self->vinfo_out);
 
   self->passthrough = FALSE;
 
@@ -833,6 +881,7 @@ gst_deinterlace_reset (GstDeinterlace * self)
   self->have_eos = FALSE;
 
   self->discont = TRUE;
+  self->telecine_tc_warned = FALSE;
 
   gst_deinterlace_set_allocation (self, NULL, NULL, NULL);
 }
@@ -980,44 +1029,6 @@ gst_deinterlace_update_pattern_timestamps (GstDeinterlace * self)
       GST_TIME_ARGS (self->pattern_buf_dur));
 }
 
-static GstVideoFrame *
-gst_deinterlace_pop_history (GstDeinterlace * self)
-{
-  GstVideoFrame *frame;
-
-  g_return_val_if_fail (self->history_count > 0, NULL);
-
-  GST_DEBUG_OBJECT (self, "Pop last history frame -- current history size %d",
-      self->history_count);
-
-  frame = self->field_history[self->history_count - 1].frame;
-
-  self->history_count--;
-  if (self->locking != GST_DEINTERLACE_LOCKING_NONE && (!self->history_count
-          || GST_VIDEO_FRAME_PLANE_DATA (frame, 0) !=
-          GST_VIDEO_FRAME_PLANE_DATA (self->field_history[self->history_count -
-                  1].frame, 0))) {
-    if (!self->low_latency)
-      self->state_count--;
-    if (self->pattern_lock) {
-      self->pattern_count++;
-      if (self->pattern != -1
-          && self->pattern_count >= telecine_patterns[self->pattern].length) {
-        self->pattern_count = 0;
-        self->output_count = 0;
-      }
-    }
-  }
-
-  GST_DEBUG_OBJECT (self, "Returning frame: %p %" GST_TIME_FORMAT
-      " with duration %" GST_TIME_FORMAT " and size %" G_GSIZE_FORMAT, frame,
-      GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (frame->buffer)),
-      GST_TIME_ARGS (GST_BUFFER_DURATION (frame->buffer)),
-      GST_VIDEO_FRAME_SIZE (frame));
-
-  return frame;
-}
-
 static void
 gst_deinterlace_get_buffer_state (GstDeinterlace * self, GstVideoFrame * frame,
     guint8 * state, GstVideoInterlaceMode * i_mode)
@@ -1032,7 +1043,8 @@ gst_deinterlace_get_buffer_state (GstDeinterlace * self, GstVideoFrame * frame,
     interlacing_mode = GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
 
   if (state) {
-    if (interlacing_mode == GST_VIDEO_INTERLACE_MODE_MIXED) {
+    if (interlacing_mode == GST_VIDEO_INTERLACE_MODE_MIXED ||
+        interlacing_mode == GST_VIDEO_INTERLACE_MODE_ALTERNATE) {
       if (GST_VIDEO_FRAME_IS_RFF (frame)) {
         *state = GST_DEINTERLACE_BUFFER_STATE_RFF;
       } else if (GST_VIDEO_FRAME_IS_ONEFIELD (frame)) {
@@ -1069,6 +1081,7 @@ gst_deinterlace_get_buffer_state (GstDeinterlace * self, GstVideoFrame * frame,
 
 #define MODE_TO_STRING(m) ((m) == GST_VIDEO_INTERLACE_MODE_MIXED ? "MIXED" : \
   (m) == GST_VIDEO_INTERLACE_MODE_INTERLEAVED ? "I" : \
+  (m) == GST_VIDEO_INTERLACE_MODE_ALTERNATE ? "A" : \
   (m) == GST_VIDEO_INTERLACE_MODE_FIELDS ? "FIELDS" : "P")
 
 static void
@@ -1089,15 +1102,17 @@ gst_deinterlace_push_history (GstDeinterlace * self, GstBuffer * buffer)
    * if this is not the case, change the map flags as appropriate
    */
   frame = gst_video_frame_new_and_map (&self->vinfo, buffer, GST_MAP_READ);
-  /* we can manage the buffer ref count using the maps from here on */
-  gst_buffer_unref (buffer);
 
   tff = GST_VIDEO_FRAME_IS_TFF (frame);
   onefield = GST_VIDEO_FRAME_IS_ONEFIELD (frame);
   fields_to_push = (onefield) ? 1 : 2;
 
-  g_return_if_fail (self->history_count <
-      GST_DEINTERLACE_MAX_FIELD_HISTORY - fields_to_push);
+  if (G_UNLIKELY (self->history_count >=
+          GST_DEINTERLACE_MAX_FIELD_HISTORY - fields_to_push)) {
+    GST_WARNING_OBJECT (self, "history count exceeded limit");
+    gst_video_frame_unmap_and_free (frame);
+    return;
+  }
 
   gst_deinterlace_get_buffer_state (self, frame, &buf_state, &interlacing_mode);
 
@@ -1126,6 +1141,12 @@ gst_deinterlace_push_history (GstDeinterlace * self, GstBuffer * buffer)
         self->field_history[i - fields_to_push].frame;
     self->field_history[i].flags =
         self->field_history[i - fields_to_push].flags;
+    self->field_history[i].tc = self->field_history[i - fields_to_push].tc;
+    self->field_history[i].caption =
+        self->field_history[i - fields_to_push].caption;
+    self->field_history[i - fields_to_push].frame = NULL;
+    self->field_history[i - fields_to_push].tc = NULL;
+    self->field_history[i - fields_to_push].caption = NULL;
   }
 
   if (field_layout == GST_DEINTERLACE_LAYOUT_AUTO) {
@@ -1159,18 +1180,65 @@ gst_deinterlace_push_history (GstDeinterlace * self, GstBuffer * buffer)
   }
 
   if (!onefield) {
+    GstVideoTimeCodeMeta *meta = gst_buffer_get_video_time_code_meta (buffer);
+    GstVideoCaptionMeta *cc_meta = gst_buffer_get_video_caption_meta (buffer);
+
     GST_DEBUG_OBJECT (self, "Two fields");
     self->field_history[1].frame = field1;
     self->field_history[1].flags = field1_flags;
 
     self->field_history[0].frame = field2;
     self->field_history[0].flags = field2_flags;
+
+    if (meta) {
+      self->field_history[0].tc = gst_video_time_code_copy (&meta->tc);
+      self->field_history[0].tc->config.flags &=
+          ~GST_VIDEO_TIME_CODE_FLAGS_INTERLACED;
+      self->field_history[1].tc = gst_video_time_code_copy (&meta->tc);
+      self->field_history[1].tc->config.flags &=
+          ~GST_VIDEO_TIME_CODE_FLAGS_INTERLACED;
+    }
+
+    if (cc_meta) {
+      self->field_history[0].caption = g_new (GstVideoCaptionMeta, 1);
+      self->field_history[0].caption->data = g_malloc (cc_meta->size);
+      self->field_history[0].caption->caption_type = cc_meta->caption_type;
+      self->field_history[0].caption->size = cc_meta->size;
+      memcpy (self->field_history[0].caption->data, cc_meta->data,
+          cc_meta->size);
+      self->field_history[1].caption = g_new (GstVideoCaptionMeta, 1);
+      self->field_history[1].caption->data = g_malloc (cc_meta->size);
+      self->field_history[1].caption->caption_type = cc_meta->caption_type;
+      self->field_history[1].caption->size = cc_meta->size;
+      memcpy (self->field_history[1].caption->data, cc_meta->data,
+          cc_meta->size);
+    }
   } else {                      /* onefield */
+    GstVideoTimeCodeMeta *meta = gst_buffer_get_video_time_code_meta (buffer);
+    GstVideoCaptionMeta *cc_meta = gst_buffer_get_video_caption_meta (buffer);
+
     GST_DEBUG_OBJECT (self, "One field");
     self->field_history[0].frame = field1;
     self->field_history[0].flags = field1_flags;
+    if (meta) {
+      self->field_history[0].tc = gst_video_time_code_copy (&meta->tc);
+      self->field_history[0].tc->config.flags &=
+          ~GST_VIDEO_TIME_CODE_FLAGS_INTERLACED;
+    }
+
+    if (cc_meta) {
+      self->field_history[0].caption = g_new (GstVideoCaptionMeta, 1);
+      self->field_history[0].caption->data = g_malloc (cc_meta->size);
+      self->field_history[0].caption->caption_type = cc_meta->caption_type;
+      self->field_history[0].caption->size = cc_meta->size;
+      memcpy (self->field_history[0].caption->data, cc_meta->data,
+          cc_meta->size);
+    }
     gst_video_frame_unmap_and_free (field2);
   }
+
+  /* we can manage the buffer ref count using the maps from here on */
+  gst_buffer_unref (buffer);
 
   self->history_count += fields_to_push;
   self->cur_field_idx += fields_to_push;
@@ -1408,7 +1476,7 @@ gst_deinterlace_get_pattern_lock (GstDeinterlace * self, gboolean * flush_one)
           break;
       }
 
-      /* make complete matches more signficant */
+      /* make complete matches more significant */
       if (k == length)
         k += GST_DEINTERLACE_MAX_BUFFER_STATE_HISTORY;
 
@@ -1493,6 +1561,7 @@ gst_deinterlace_output_frame (GstDeinterlace * self, gboolean flushing)
   TelecinePattern pattern;
   guint8 phase, count;
   const GstDeinterlaceLocking locking = self->locking;
+  gboolean cc_added = FALSE;
 
   memset (&pattern, 0, sizeof (pattern));
 
@@ -1561,7 +1630,8 @@ restart:
 
       /* setcaps on sink and src pads */
       sinkcaps = gst_pad_get_current_caps (self->sinkpad);
-      if (!sinkcaps || !gst_deinterlace_setcaps (self, self->sinkpad, sinkcaps)) {
+      if (!sinkcaps
+          || !gst_deinterlace_setcaps (self, self->sinkpad, sinkcaps, FALSE)) {
         if (sinkcaps)
           gst_caps_unref (sinkcaps);
         return GST_FLOW_NOT_NEGOTIATED;
@@ -1572,7 +1642,7 @@ restart:
       if (flush_one && self->drop_orphans) {
         GST_DEBUG_OBJECT (self, "Dropping orphan first field");
         self->cur_field_idx--;
-        gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+        gst_deinterlace_pop_and_clear (self);
         goto restart;
       }
     }
@@ -1632,15 +1702,17 @@ restart:
     GST_DEBUG_OBJECT (self,
         "Frame type: Progressive; pushing buffer as a frame");
     /* pop and push */
+    gst_deinterlace_delete_meta_at (self, self->history_count - 1);
     self->cur_field_idx--;
     field1_frame = gst_deinterlace_pop_history (self);
     field1_buffer = field1_frame->buffer;
     gst_buffer_ref (field1_buffer);
     gst_video_frame_unmap_and_free (field1_frame);
+
     /* field2 is the same buffer as field1, but we need to remove it from the
      * history anyway */
     self->cur_field_idx--;
-    gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+    gst_deinterlace_pop_and_clear (self);
     GST_DEBUG_OBJECT (self,
         "[OUT] ts %" GST_TIME_FORMAT ", dur %" GST_TIME_FORMAT ", end %"
         GST_TIME_FORMAT,
@@ -1733,6 +1805,8 @@ restart:
               || IS_TELECINE (interlacing_mode)))
       || (self->fields == GST_DEINTERLACE_ALL
           && !IS_TELECINE (interlacing_mode))) {
+    gint index;
+
     GST_DEBUG_OBJECT (self, "deinterlacing top field");
 
     /* create new buffer */
@@ -1743,10 +1817,37 @@ restart:
     g_return_val_if_fail (self->history_count >=
         1 + gst_deinterlace_method_get_latency (self->method), GST_FLOW_ERROR);
 
-    buf =
-        self->field_history[self->history_count - 1 -
-        gst_deinterlace_method_get_latency (self->method)].frame->buffer;
+    index =
+        self->history_count - 1 -
+        gst_deinterlace_method_get_latency (self->method);
+    buf = self->field_history[index].frame->buffer;
 
+    if (self->field_history[index].tc) {
+      gst_buffer_add_video_time_code_meta (outbuf,
+          self->field_history[index].tc);
+    }
+    if (self->field_history[index].caption) {
+      g_assert (self->field_history[index].caption->data != NULL);
+      g_assert (!cc_added);
+      gst_buffer_add_video_caption_meta (outbuf,
+          self->field_history[index].caption->caption_type,
+          self->field_history[index].caption->data,
+          self->field_history[index].caption->size);
+      cc_added = TRUE;
+    }
+    if (IS_TELECINE (interlacing_mode) && !self->telecine_tc_warned) {
+      self->telecine_tc_warned = TRUE;
+      GST_FIXME_OBJECT (self,
+          "Detected telecine timecodes when deinterlacing. This is not "
+          "supported yet. Resulting timecode may be wrong");
+    }
+    if (self->fields == GST_DEINTERLACE_ALL) {
+      GstVideoTimeCodeMeta *meta = gst_buffer_get_video_time_code_meta (outbuf);
+      if (meta) {
+        meta->tc.config.fps_n = 2 * meta->tc.config.fps_n;
+        meta->tc.frames = 2 * meta->tc.frames;
+      }
+    }
     if (!IS_TELECINE (interlacing_mode)) {
       timestamp = GST_BUFFER_TIMESTAMP (buf);
 
@@ -1776,14 +1877,14 @@ restart:
     /* Check if we need to drop the frame because of QoS */
     if (!gst_deinterlace_do_qos (self, buf)) {
       self->cur_field_idx--;
-      gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+      gst_deinterlace_pop_and_clear (self);
       gst_buffer_unref (outbuf);
       outbuf = NULL;
       ret = GST_FLOW_OK;
     } else {
       if (self->cur_field_idx < 0 && flushing) {
         if (self->history_count == 1) {
-          gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+          gst_deinterlace_pop_and_clear (self);
           goto need_more;
         }
         self->cur_field_idx++;
@@ -1798,7 +1899,7 @@ restart:
       /* map the frame so the deinterlace methods can write the data to the
        * correct memory locations */
       outframe =
-          gst_video_frame_new_and_map (&self->vinfo, outbuf, GST_MAP_WRITE);
+          gst_video_frame_new_and_map (&self->vinfo_out, outbuf, GST_MAP_WRITE);
 
       /* do magic calculus */
       gst_deinterlace_method_deinterlace_frame (self->method,
@@ -1814,7 +1915,7 @@ restart:
           || self->cur_field_idx + 1 +
           gst_deinterlace_method_get_latency (self->method) <
           self->history_count || flushing) {
-        gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+        gst_deinterlace_pop_and_clear (self);
       }
 
       if (gst_deinterlace_clip_buffer (self, outbuf)) {
@@ -1843,7 +1944,7 @@ restart:
         GST_DEBUG_OBJECT (self, "Removing unused field (count: %d)",
             self->history_count);
         self->cur_field_idx--;
-        gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+        gst_deinterlace_pop_and_clear (self);
         interlacing_mode = GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
         return ret;
       }
@@ -1860,7 +1961,7 @@ restart:
           && !IS_TELECINE (interlacing_mode))) {
     GST_DEBUG_OBJECT (self, "Removing unused top field");
     self->cur_field_idx--;
-    gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+    gst_deinterlace_pop_and_clear (self);
 
     if (flush_one && !self->drop_orphans) {
       GST_DEBUG_OBJECT (self, "Orphan field deinterlaced - reconfiguring");
@@ -1880,6 +1981,8 @@ restart:
               || IS_TELECINE (interlacing_mode)))
       || (self->fields == GST_DEINTERLACE_ALL
           && !IS_TELECINE (interlacing_mode))) {
+    gint index;
+
     GST_DEBUG_OBJECT (self, "deinterlacing bottom field");
 
     /* create new buffer */
@@ -1890,9 +1993,36 @@ restart:
     g_return_val_if_fail (self->history_count >=
         gst_deinterlace_method_get_latency (self->method) + 1, GST_FLOW_ERROR);
 
-    buf =
-        self->field_history[self->history_count - 1 -
-        gst_deinterlace_method_get_latency (self->method)].frame->buffer;
+    index =
+        self->history_count - 1 -
+        gst_deinterlace_method_get_latency (self->method);
+    buf = self->field_history[index].frame->buffer;
+
+    if (self->field_history[index].tc) {
+      gst_buffer_add_video_time_code_meta (outbuf,
+          self->field_history[index].tc);
+    }
+    if (self->field_history[index].caption && !cc_added) {
+      g_assert (self->field_history[index].caption->data != NULL);
+      gst_buffer_add_video_caption_meta (outbuf,
+          self->field_history[index].caption->caption_type,
+          self->field_history[index].caption->data,
+          self->field_history[index].caption->size);
+      cc_added = TRUE;
+    }
+    if (IS_TELECINE (interlacing_mode) && !self->telecine_tc_warned) {
+      self->telecine_tc_warned = TRUE;
+      GST_FIXME_OBJECT (self,
+          "Detected telecine timecodes when deinterlacing. This is not "
+          "supported yet. Resulting timecode may be wrong");
+    }
+    if (self->fields == GST_DEINTERLACE_ALL) {
+      GstVideoTimeCodeMeta *meta = gst_buffer_get_video_time_code_meta (outbuf);
+      if (meta) {
+        meta->tc.config.fps_n = 2 * meta->tc.config.fps_n;
+        meta->tc.frames = 2 * meta->tc.frames + 1;
+      }
+    }
     if (!IS_TELECINE (interlacing_mode)) {
       timestamp = GST_BUFFER_TIMESTAMP (buf);
 
@@ -1922,7 +2052,7 @@ restart:
     /* Check if we need to drop the frame because of QoS */
     if (!gst_deinterlace_do_qos (self, buf)) {
       self->cur_field_idx--;
-      gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+      gst_deinterlace_pop_and_clear (self);
       gst_buffer_unref (outbuf);
       outbuf = NULL;
       ret = GST_FLOW_OK;
@@ -1930,7 +2060,7 @@ restart:
       /* map the frame so the deinterlace methods can write the data to the
        * correct memory locations */
       outframe =
-          gst_video_frame_new_and_map (&self->vinfo, outbuf, GST_MAP_WRITE);
+          gst_video_frame_new_and_map (&self->vinfo_out, outbuf, GST_MAP_WRITE);
 
       /* do magic calculus */
       gst_deinterlace_method_deinterlace_frame (self->method,
@@ -1946,7 +2076,7 @@ restart:
           || self->cur_field_idx + 1 +
           gst_deinterlace_method_get_latency (self->method) <
           self->history_count) {
-        gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+        gst_deinterlace_pop_and_clear (self);
       }
 
       if (gst_deinterlace_clip_buffer (self, outbuf)) {
@@ -1971,7 +2101,7 @@ restart:
         GST_DEBUG_OBJECT (self, "Removing unused field (count: %d)",
             self->history_count);
         self->cur_field_idx--;
-        gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+        gst_deinterlace_pop_and_clear (self);
         interlacing_mode = GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
         return ret;
       }
@@ -1988,7 +2118,7 @@ restart:
           && !IS_TELECINE (interlacing_mode))) {
     GST_DEBUG_OBJECT (self, "Removing unused bottom field");
     self->cur_field_idx--;
-    gst_video_frame_unmap_and_free (gst_deinterlace_pop_history (self));
+    gst_deinterlace_pop_and_clear (self);
 
     if (flush_one && !self->drop_orphans) {
       GST_DEBUG_OBJECT (self, "Orphan field deinterlaced - reconfiguring");
@@ -2048,11 +2178,16 @@ gst_deinterlace_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   GST_OBJECT_LOCK (self);
   if (self->reconfigure || gst_pad_check_reconfigure (self->srcpad)) {
     GstCaps *caps;
+    gboolean force_reconfigure = FALSE;
 
-    if ((gint) self->new_fields != -1)
+    if ((gint) self->new_fields != -1) {
+      force_reconfigure |= (self->user_set_fields != self->new_fields);
       self->user_set_fields = self->new_fields;
-    if ((gint) self->new_mode != -1)
+    }
+    if ((gint) self->new_mode != -1) {
+      force_reconfigure |= (self->mode != self->new_mode);
       self->mode = self->new_mode;
+    }
     self->new_mode = -1;
     self->new_fields = -1;
 
@@ -2060,7 +2195,8 @@ gst_deinterlace_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     GST_OBJECT_UNLOCK (self);
     caps = gst_pad_get_current_caps (self->sinkpad);
     if (caps != NULL) {
-      if (!gst_deinterlace_setcaps (self, self->sinkpad, caps)) {
+      if (!gst_deinterlace_setcaps (self, self->sinkpad, caps,
+              force_reconfigure)) {
         gst_pad_mark_reconfigure (self->srcpad);
         gst_caps_unref (caps);
         if (GST_PAD_IS_FLUSHING (self->srcpad))
@@ -2300,6 +2436,22 @@ gst_deinterlace_caps_double_framerate (GstCaps * caps, gboolean half)
 }
 
 static GstCaps *
+dup_caps_with_alternate (GstCaps * caps)
+{
+  GstCaps *with_alternate;
+  GstCapsFeatures *features;
+
+  with_alternate = gst_caps_copy (caps);
+  features = gst_caps_features_new (GST_CAPS_FEATURE_FORMAT_INTERLACED, NULL);
+  gst_caps_set_features_simple (with_alternate, features);
+
+  gst_caps_set_simple (with_alternate, "interlace-mode", G_TYPE_STRING,
+      "alternate", NULL);
+
+  return with_alternate;
+}
+
+static GstCaps *
 gst_deinterlace_getcaps (GstDeinterlace * self, GstPad * pad, GstCaps * filter)
 {
   GstCaps *ret, *caps;
@@ -2387,11 +2539,18 @@ gst_deinterlace_getcaps (GstDeinterlace * self, GstPad * pad, GstCaps * filter)
   for (len = gst_caps_get_size (tmp2); len > 0; len--) {
     GstStructure *s = gst_caps_get_structure (tmp2, len - 1);
 
-    if (pad == self->sinkpad)
+    /* Drop fields which can be converted by us.
+     * Specifically "field-order" here.
+     * "field-order" with "progressive" and/or
+     * unspecified "interlace-mode" would cause negotiation issue */
+    gst_structure_remove_field (s, "field-order");
+
+    if (pad == self->sinkpad) {
       gst_structure_remove_field (s, "interlace-mode");
-    else
+    } else {
       gst_structure_set (s, "interlace-mode", G_TYPE_STRING, "progressive",
           NULL);
+    }
   }
 
   if (self->user_set_fields == GST_DEINTERLACE_ALL) {
@@ -2418,6 +2577,17 @@ gst_deinterlace_getcaps (GstDeinterlace * self, GstPad * pad, GstCaps * filter)
 
   gst_caps_unref (caps);
   caps = NULL;
+
+  if (pad == self->sinkpad) {
+    GstCaps *can_deinterlace;
+
+    tmp = gst_static_caps_get (&deinterlace_caps);
+    can_deinterlace = gst_caps_intersect (ret, tmp);
+    gst_caps_unref (tmp);
+
+    ret = gst_caps_merge (ret, dup_caps_with_alternate (can_deinterlace));
+    gst_caps_unref (can_deinterlace);
+  }
 
 done:
 
@@ -2517,8 +2687,12 @@ gst_deinterlace_do_bufferpool (GstDeinterlace * self, GstCaps * outcaps)
   if (gst_query_get_n_allocation_pools (query) > 0)
     gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
   else {
+    GstVideoInfo out_info;
+
+    gst_video_info_from_caps (&out_info, outcaps);
+
     pool = NULL;
-    size = GST_VIDEO_INFO_SIZE (&self->vinfo);
+    size = GST_VIDEO_INFO_SIZE (&out_info);
     min =
         MAX ((gst_deinterlace_method_get_fields_required (self->method) +
             1) / 2 + 1, 4);
@@ -2548,16 +2722,19 @@ gst_deinterlace_do_bufferpool (GstDeinterlace * self, GstCaps * outcaps)
 
 
 static gboolean
-gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
+gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps,
+    gboolean force)
 {
-  GstCaps *srccaps = NULL;
+  GstCaps *srccaps = NULL, *caps_no_feat = NULL;
   GstVideoInterlaceMode interlacing_mode;
   gint fps_n, fps_d;
   GstCaps *peercaps, *current_caps;
 
   gst_pad_check_reconfigure (self->srcpad);
 
-  if ((current_caps = gst_pad_get_current_caps (pad))) {
+  /* If the force flag is set, always re-check the downstream caps,
+   * and reconfigure as the deinterlace mode has changed */
+  if (!force && (current_caps = gst_pad_get_current_caps (pad))) {
     if (gst_caps_is_equal (caps, current_caps)) {
       GST_DEBUG_OBJECT (pad, "Got same caps again, returning");
       gst_caps_unref (current_caps);
@@ -2604,6 +2781,26 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
   if (!gst_video_info_from_caps (&self->vinfo, caps))
     goto invalid_caps;
 
+  gst_video_info_set_interlaced_format (&self->vinfo_out,
+      GST_VIDEO_INFO_FORMAT (&self->vinfo),
+      GST_VIDEO_INTERLACE_MODE_PROGRESSIVE,
+      GST_VIDEO_INFO_WIDTH (&self->vinfo),
+      GST_VIDEO_INFO_HEIGHT (&self->vinfo));
+
+  if (GST_VIDEO_INFO_INTERLACE_MODE (&self->vinfo) ==
+      GST_VIDEO_INTERLACE_MODE_ALTERNATE) {
+    /* alternate interlace mode uses a caps feature, remove it when interesecting caps
+     * and setting the src pad caps. */
+    GstCapsFeatures *features;
+
+    caps_no_feat = gst_caps_copy (caps);
+
+    features = gst_caps_get_features (caps_no_feat, 0);
+    gst_caps_features_remove (features, GST_CAPS_FEATURE_FORMAT_INTERLACED);
+  } else {
+    caps_no_feat = gst_caps_ref (caps);
+  }
+
   fps_n = GST_VIDEO_INFO_FPS_N (&self->vinfo);
   fps_d = GST_VIDEO_INFO_FPS_D (&self->vinfo);
 
@@ -2614,7 +2811,7 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
   } else if (self->mode == GST_DEINTERLACE_MODE_INTERLACED) {
     GstCaps *tmp = gst_static_caps_get (&deinterlace_caps);
 
-    if (!gst_caps_can_intersect (caps, tmp)) {
+    if (!gst_caps_can_intersect (caps_no_feat, tmp)) {
       gst_caps_unref (tmp);
       GST_ERROR_OBJECT (self, "Unsupported caps for mode=interlaced");
       goto invalid_caps;
@@ -2631,7 +2828,7 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
       GST_DEBUG_OBJECT (self,
           "Passthrough because mode=auto and progressive caps");
       self->passthrough = TRUE;
-    } else if (gst_caps_can_intersect (caps, tmp)) {
+    } else if (gst_caps_can_intersect (caps_no_feat, tmp)) {
       if (peercaps) {
         GstCaps *allowed_caps;
         GstCaps *tmp2;
@@ -2691,7 +2888,7 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
 
   if (!self->passthrough) {
     if (self->pattern_lock) {
-      srccaps = gst_caps_copy (caps);
+      srccaps = gst_caps_copy (caps_no_feat);
       if (self->pattern != -1
           && G_UNLIKELY (!gst_util_fraction_multiply (fps_n, fps_d,
                   telecine_patterns[self->pattern].ratio_n,
@@ -2704,17 +2901,17 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
         || self->low_latency == 0) {
       /* in high latency pattern locking mode if we don't have a pattern lock,
        * the sink pad caps are the best we know */
-      srccaps = gst_caps_copy (caps);
+      srccaps = gst_caps_copy (caps_no_feat);
     } else if (self->low_latency > 0
         && interlacing_mode == GST_VIDEO_INTERLACE_MODE_MIXED
         && self->pattern == -1) {
       /* for initial buffers of a telecine pattern, until there is a lock we
        * we output naïvely adjusted timestamps in low-latency pattern locking
        * mode */
-      srccaps = gst_caps_copy (caps);
+      srccaps = gst_caps_copy (caps_no_feat);
       gst_caps_set_simple (srccaps, "framerate", GST_TYPE_FRACTION, 0, 1, NULL);
     } else if (self->user_set_fields == GST_DEINTERLACE_FIELDS_AUTO) {
-      srccaps = gst_caps_copy (caps);
+      srccaps = gst_caps_copy (caps_no_feat);
       if (peercaps) {
         gboolean can_be_tf = FALSE;
 
@@ -2752,7 +2949,7 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
       }
     } else {
       self->fields = self->user_set_fields;
-      srccaps = gst_caps_copy (caps);
+      srccaps = gst_caps_copy (caps_no_feat);
       if (self->fields == GST_DEINTERLACE_ALL)
         srccaps = gst_deinterlace_caps_double_framerate (srccaps, FALSE);
     }
@@ -2761,10 +2958,15 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
     gst_caps_set_simple (srccaps, "interlace-mode", G_TYPE_STRING,
         "progressive", NULL);
 
+    {
+      GstStructure *s = gst_caps_get_structure (srccaps, 0);
+      gst_structure_remove_field (s, "field-order");
+    }
+
     gst_deinterlace_set_method (self, self->method_id);
     gst_deinterlace_method_setup (self->method, &self->vinfo);
   } else {
-    srccaps = gst_caps_ref (caps);
+    srccaps = gst_caps_ref (caps_no_feat);
   }
 
   if (fps_n != 0) {
@@ -2785,6 +2987,7 @@ gst_deinterlace_setcaps (GstDeinterlace * self, GstPad * pad, GstCaps * caps)
   if (peercaps)
     gst_caps_unref (peercaps);
   gst_caps_unref (srccaps);
+  g_clear_pointer (&caps_no_feat, gst_caps_unref);
 
   return TRUE;
 
@@ -2792,6 +2995,7 @@ invalid_caps:
   {
     if (peercaps)
       gst_caps_unref (peercaps);
+    g_clear_pointer (&caps_no_feat, gst_caps_unref);
     GST_ERROR_OBJECT (pad, "Invalid caps: %" GST_PTR_FORMAT, caps);
     gst_pad_mark_reconfigure (self->srcpad);
     return FALSE;
@@ -2802,6 +3006,7 @@ set_caps_failed:
     if (peercaps)
       gst_caps_unref (peercaps);
     gst_caps_unref (srccaps);
+    g_clear_pointer (&caps_no_feat, gst_caps_unref);
     gst_pad_mark_reconfigure (self->srcpad);
     return FALSE;
   }
@@ -2811,6 +3016,7 @@ no_bufferpool:
     if (peercaps)
       gst_caps_unref (peercaps);
     gst_caps_unref (srccaps);
+    g_clear_pointer (&caps_no_feat, gst_caps_unref);
     gst_pad_mark_reconfigure (self->srcpad);
     return FALSE;
   }
@@ -2831,7 +3037,7 @@ gst_deinterlace_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       GstCaps *caps = NULL;
 
       gst_event_parse_caps (event, &caps);
-      res = gst_deinterlace_setcaps (self, pad, caps);
+      res = gst_deinterlace_setcaps (self, pad, caps, FALSE);
       gst_event_unref (event);
       break;
     }
@@ -2900,6 +3106,7 @@ gst_deinterlace_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
         GST_DEBUG_OBJECT (self, "Ending still frames");
         self->still_frame_mode = FALSE;
       }
+      self->telecine_tc_warned = FALSE;
       gst_deinterlace_reset_qos (self);
       res = gst_pad_push_event (self->srcpad, event);
       gst_deinterlace_reset_history (self, TRUE);
@@ -3120,8 +3327,9 @@ gst_deinterlace_src_query (GstPad * pad, GstObject * parent, GstQuery * query)
   return res;
 }
 
+
 static gboolean
-plugin_init (GstPlugin * plugin)
+deinterlace_element_init (GstPlugin * plugin)
 {
   GST_DEBUG_CATEGORY_INIT (deinterlace_debug, "deinterlace", 0, "Deinterlacer");
 
@@ -3129,12 +3337,14 @@ plugin_init (GstPlugin * plugin)
   orc_init ();
 #endif
 
-  if (!gst_element_register (plugin, "deinterlace", GST_RANK_NONE,
-          GST_TYPE_DEINTERLACE)) {
-    return FALSE;
-  }
+  return gst_element_register (plugin, "deinterlace", GST_RANK_NONE,
+      GST_TYPE_DEINTERLACE);
+}
 
-  return TRUE;
+static gboolean
+plugin_init (GstPlugin * plugin)
+{
+  return GST_ELEMENT_REGISTER (deinterlace, plugin);
 }
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,

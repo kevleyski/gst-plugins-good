@@ -503,6 +503,9 @@ gst_v4l2_allocator_probe (GstV4l2Allocator * allocator, guint32 memory,
       flags |= bcreate_flag;
   }
 
+  if (breq.capabilities & V4L2_BUF_CAP_SUPPORTS_ORPHANED_BUFS)
+    flags |= GST_V4L2_ALLOCATOR_FLAG_SUPPORTS_ORPHANED_BUFS;
+
   return flags;
 }
 
@@ -517,6 +520,9 @@ gst_v4l2_allocator_create_buf (GstV4l2Allocator * allocator)
 
   if (!g_atomic_int_get (&allocator->active))
     goto done;
+
+  if (GST_V4L2_ALLOCATOR_IS_ORPHANED (allocator))
+    goto orphaned_bug;
 
   bcreate.memory = allocator->memory;
   bcreate.format = obj->format;
@@ -542,6 +548,12 @@ done:
   GST_OBJECT_UNLOCK (allocator);
   return group;
 
+orphaned_bug:
+  {
+    GST_ERROR_OBJECT (allocator, "allocator was orphaned, "
+        "not creating new buffers");
+    goto done;
+  }
 create_bufs_failed:
   {
     GST_WARNING_OBJECT (allocator, "error creating a new buffer: %s",
@@ -628,7 +640,7 @@ gst_v4l2_allocator_new (GstObject * parent, GstV4l2Object * v4l2object)
   /* Save everything */
   allocator->obj = v4l2object;
 
-  /* Keep a ref on the elemnt so obj does not disapear */
+  /* Keep a ref on the element so obj does not disappear */
   gst_object_ref (allocator->obj->element);
 
   flags |= GST_V4L2_ALLOCATOR_PROBE (allocator, MMAP);
@@ -666,6 +678,9 @@ gst_v4l2_allocator_start (GstV4l2Allocator * allocator, guint32 count,
 
   if (g_atomic_int_get (&allocator->active))
     goto already_active;
+
+  if (GST_V4L2_ALLOCATOR_IS_ORPHANED (allocator))
+    goto orphaned;
 
   if (obj->ioctl (obj->video_fd, VIDIOC_REQBUFS, &breq) < 0)
     goto reqbufs_failed;
@@ -713,6 +728,11 @@ done:
 already_active:
   {
     GST_ERROR_OBJECT (allocator, "allocator already active");
+    goto error;
+  }
+orphaned:
+  {
+    GST_ERROR_OBJECT (allocator, "allocator was orphaned");
     goto error;
   }
 reqbufs_failed:
@@ -765,10 +785,12 @@ gst_v4l2_allocator_stop (GstV4l2Allocator * allocator)
       gst_v4l2_memory_group_free (group);
   }
 
-  /* Not all drivers support rebufs(0), so warn only */
-  if (obj->ioctl (obj->video_fd, VIDIOC_REQBUFS, &breq) < 0)
-    GST_WARNING_OBJECT (allocator,
-        "error releasing buffers buffers: %s", g_strerror (errno));
+  if (!GST_V4L2_ALLOCATOR_IS_ORPHANED (allocator)) {
+    /* Not all drivers support rebufs(0), so warn only */
+    if (obj->ioctl (obj->video_fd, VIDIOC_REQBUFS, &breq) < 0)
+      GST_WARNING_OBJECT (allocator,
+          "error releasing buffers buffers: %s", g_strerror (errno));
+  }
 
   allocator->count = 0;
 
@@ -777,6 +799,29 @@ gst_v4l2_allocator_stop (GstV4l2Allocator * allocator)
 done:
   GST_OBJECT_UNLOCK (allocator);
   return ret;
+}
+
+gboolean
+gst_v4l2_allocator_orphan (GstV4l2Allocator * allocator)
+{
+  GstV4l2Object *obj = allocator->obj;
+  struct v4l2_requestbuffers breq = { 0, obj->type, allocator->memory };
+
+  if (!GST_V4L2_ALLOCATOR_CAN_ORPHAN_BUFS (allocator))
+    return FALSE;
+
+  GST_OBJECT_FLAG_SET (allocator, GST_V4L2_ALLOCATOR_FLAG_ORPHANED);
+
+  if (!g_atomic_int_get (&allocator->active))
+    return TRUE;
+
+  if (obj->ioctl (obj->video_fd, VIDIOC_REQBUFS, &breq) < 0) {
+    GST_ERROR_OBJECT (allocator,
+        "error orphaning buffers buffers: %s", g_strerror (errno));
+    return FALSE;
+  }
+
+  return TRUE;
 }
 
 GstV4l2MemoryGroup *
@@ -852,7 +897,6 @@ gst_v4l2_allocator_alloc_dmabuf (GstV4l2Allocator * allocator,
   for (i = 0; i < group->n_mem; i++) {
     GstV4l2Memory *mem;
     GstMemory *dma_mem;
-    gint dmafd;
 
     if (group->mem[i] == NULL) {
       struct v4l2_exportbuffer expbuf = { 0 };
@@ -882,11 +926,8 @@ gst_v4l2_allocator_alloc_dmabuf (GstV4l2Allocator * allocator,
     g_assert (gst_is_v4l2_memory (group->mem[i]));
     mem = (GstV4l2Memory *) group->mem[i];
 
-    if ((dmafd = dup (mem->dmafd)) < 0)
-      goto dup_failed;
-
-    dma_mem = gst_dmabuf_allocator_alloc (dmabuf_allocator, dmafd,
-        group->planes[i].length);
+    dma_mem = gst_fd_allocator_alloc (dmabuf_allocator, mem->dmafd,
+        group->planes[i].length, GST_FD_MEMORY_FLAG_DONT_CLOSE);
     gst_memory_resize (dma_mem, group->planes[i].data_offset,
         group->planes[i].length - group->planes[i].data_offset);
 
@@ -903,12 +944,6 @@ gst_v4l2_allocator_alloc_dmabuf (GstV4l2Allocator * allocator,
 expbuf_failed:
   {
     GST_ERROR_OBJECT (allocator, "Failed to export DMABUF: %s",
-        g_strerror (errno));
-    goto cleanup;
-  }
-dup_failed:
-  {
-    GST_ERROR_OBJECT (allocator, "Failed to dup DMABUF descriptor: %s",
         g_strerror (errno));
     goto cleanup;
   }
@@ -933,11 +968,8 @@ gst_v4l2_allocator_clear_dmabufin (GstV4l2Allocator * allocator,
 
     mem = (GstV4l2Memory *) group->mem[i];
 
-    GST_LOG_OBJECT (allocator, "clearing DMABUF import, fd %i plane %d",
-        mem->dmafd, i);
-
-    if (mem->dmafd >= 0)
-      close (mem->dmafd);
+    GST_LOG_OBJECT (allocator, "[%i] clearing DMABUF import, fd %i plane %d",
+        group->buffer.index, mem->dmafd, i);
 
     /* Update memory */
     mem->mem.maxsize = 0;
@@ -1004,8 +1036,8 @@ gst_v4l2_allocator_clear_userptr (GstV4l2Allocator * allocator,
   for (i = 0; i < group->n_mem; i++) {
     mem = (GstV4l2Memory *) group->mem[i];
 
-    GST_LOG_OBJECT (allocator, "clearing USERPTR %p plane %d size %"
-        G_GSIZE_FORMAT, mem->data, i, mem->mem.size);
+    GST_LOG_OBJECT (allocator, "[%i] clearing USERPTR %p plane %d size %"
+        G_GSIZE_FORMAT, group->buffer.index, mem->data, i, mem->mem.size);
 
     mem->mem.maxsize = 0;
     mem->mem.size = 0;
@@ -1078,10 +1110,10 @@ gst_v4l2_allocator_import_dmabuf (GstV4l2Allocator * allocator,
 
     size = gst_memory_get_sizes (dma_mem[i], &offset, &maxsize);
 
-    if ((dmafd = dup (gst_dmabuf_memory_get_fd (dma_mem[i]))) < 0)
-      goto dup_failed;
+    dmafd = gst_dmabuf_memory_get_fd (dma_mem[i]);
 
-    GST_LOG_OBJECT (allocator, "imported DMABUF as fd %i plane %d", dmafd, i);
+    GST_LOG_OBJECT (allocator, "[%i] imported DMABUF as fd %i plane %d",
+        group->buffer.index, dmafd, i);
 
     mem = (GstV4l2Memory *) group->mem[i];
 
@@ -1123,12 +1155,6 @@ not_dmabuf:
     GST_ERROR_OBJECT (allocator, "Memory %i is not of DMABUF", i);
     return FALSE;
   }
-dup_failed:
-  {
-    GST_ERROR_OBJECT (allocator, "Failed to dup DMABUF descriptor: %s",
-        g_strerror (errno));
-    return FALSE;
-  }
 }
 
 gboolean
@@ -1149,18 +1175,16 @@ gst_v4l2_allocator_import_userptr (GstV4l2Allocator * allocator,
   for (i = 0; i < group->n_mem; i++) {
     gsize maxsize, psize;
 
-    if (V4L2_TYPE_IS_MULTIPLANAR (obj->type)) {
-      maxsize = group->planes[i].length;
-      psize = size[i];
-    } else {
-      maxsize = group->planes[i].length;
-      psize = img_size;
-    }
+    /* TODO request used size and maxsize separately */
+    if (V4L2_TYPE_IS_MULTIPLANAR (obj->type))
+      maxsize = psize = size[i];
+    else
+      maxsize = psize = img_size;
 
     g_assert (psize <= img_size);
 
-    GST_LOG_OBJECT (allocator, "imported USERPTR %p plane %d size %"
-        G_GSIZE_FORMAT, data[i], i, psize);
+    GST_LOG_OBJECT (allocator, "[%i] imported USERPTR %p plane %d size %"
+        G_GSIZE_FORMAT, group->buffer.index, data[i], i, psize);
 
     mem = (GstV4l2Memory *) group->mem[i];
 
@@ -1342,7 +1366,7 @@ gst_v4l2_allocator_dqbuf (GstV4l2Allocator * allocator,
 
       offset = group->planes[i].data_offset;
 
-      if (group->planes[i].bytesused > group->planes[i].data_offset) {
+      if (group->planes[i].bytesused >= group->planes[i].data_offset) {
         size = group->planes[i].bytesused - group->planes[i].data_offset;
       } else {
         GST_WARNING_OBJECT (allocator, "V4L2 provided buffer has bytesused %"

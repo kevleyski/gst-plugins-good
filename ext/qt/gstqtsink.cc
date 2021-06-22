@@ -21,12 +21,58 @@
 /**
  * SECTION:gstqtsink
  *
+ * qmlglsink provides a way to render a video stream as a Qml object inside
+ * the Qml scene graph.  This is achieved by providing the incoming OpenGL
+ * textures to Qt as a scene graph object.
+ *
+ * qmlglsink will attempt to retrieve the windowing system display connection
+ * that Qt is using (#GstGLDisplay).  This may be different to any already
+ * existing window system display connection already in use in the pipeline for
+ * a number of reasons.  A couple of examples of this are:
+ *
+ * 1. Adding qmlglsink to an already running pipeline
+ * 2. Not having any qmlglsink (or qmlgloverlay) element start up before any
+ *    other OpenGL-based element in the pipeline.
+ *
+ * If one of these scenarios occurs, then there will be multiple OpenGL contexts
+ * in use in the pipeline.  This means that either the pipeline will fail to
+ * start up correctly, a downstream element may reject buffers, or a complete
+ * GPU->System memory->GPU transfer is performed for every buffer.
+ *
+ * The requirement to avoid this is that all elements share the same
+ * #GstGLDisplay object and as Qt cannot currently share an existing window
+ * system display connection, GStreamer must use the window system display
+ * connection provided by Qt.  This window system display connection can be
+ * retrieved by either a qmlglsink element or a qmlgloverlay element. The
+ * recommended usage is to have either element (qmlglsink or qmlgloverlay)
+ * be the first to propagate the #GstGLDisplay for the entire pipeline to use by
+ * setting either element to the READY element state before any other OpenGL
+ * element in the pipeline.
+ *
+ * In a dynamically adding qmlglsink (or qmlgloverlay) to a pipeline case,
+ * there are some considerations for ensuring that the window system display
+ * and OpenGL contexts are compatible with Qt.  When the qmlgloverlay (or
+ * qmlglsink) element is added and brought up to READY, it will propagate it's
+ * own #GstGLDisplay using the #GstContext mechanism regardless of any existing
+ * #GstGLDisplay used by the pipeline previously.  In order for the new
+ * #GstGLDisplay to be used, the application must then set the provided
+ * #GstGLDisplay containing #GstContext on the pipeline.  This may effectively
+ * cause each OpenGL element to replace the window system display and also the
+ * OpenGL context it is using.  As such this process may take a significant
+ * amount of time and resources as objects are recreated in the new OpenGL
+ * context.
+ *
+ * All instances of qmlglsink and qmlgloverlay will return the exact same
+ * #GstGLDisplay object while the pipeline is running regardless of whether
+ * any qmlglsink or qmlgloverlay elements are added or removed from the
+ * pipeline.
  */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
+#include "gstqtelements.h"
 #include "gstqtsink.h"
 #include <QtGui/QGuiApplication>
 
@@ -89,6 +135,8 @@ enum
 G_DEFINE_TYPE_WITH_CODE (GstQtSink, gst_qt_sink,
     GST_TYPE_VIDEO_SINK, GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT,
         "qtsink", 0, "Qt Video Sink"));
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (qmlglsink, "qmlglsink",
+    GST_RANK_NONE, GST_TYPE_QT_SINK, qt5_element_init (plugin));
 
 static void
 gst_qt_sink_class_init (GstQtSinkClass * klass)
@@ -320,6 +368,13 @@ gst_qt_sink_change_state (GstElement * element, GstStateChange transition)
             (NULL));
         return GST_STATE_CHANGE_FAILURE;
       }
+
+      GST_OBJECT_LOCK (qt_sink->display);
+      gst_gl_display_add_context (qt_sink->display, qt_sink->context);
+      GST_OBJECT_UNLOCK (qt_sink->display);
+
+      gst_gl_element_propagate_display_context (GST_ELEMENT (qt_sink), qt_sink->display);
+
       break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
       break;

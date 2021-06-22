@@ -1,6 +1,6 @@
 project('gst-plugins-good', 'c',
-  version : '1.15.0.1',
-  meson_version : '>= 0.46.0',
+  version : '1.19.1.1',
+  meson_version : '>= 0.54',
   default_options : [ 'warning_level=1',
                       'buildtype=debugoptimized' ])
 
@@ -14,29 +14,44 @@ gst_version_micro = version_arr[2].to_int()
 else
   gst_version_nano = 0
 endif
+gst_version_is_dev = gst_version_minor % 2 == 1 and gst_version_micro < 90
 
-have_cxx = add_languages('cpp', required : false)
+have_cxx = add_languages('cpp', native: false, required: false)
 
-glib_req = '>= 2.40.0'
+glib_req = '>= 2.56.0'
+orc_req = '>= 0.4.17'
 gst_req = '>= @0@.@1@.0'.format(gst_version_major, gst_version_minor)
 
 api_version = '1.0'
 
-plugins_install_dir = '@0@/gstreamer-1.0'.format(get_option('libdir'))
+plugins_install_dir = join_paths(get_option('libdir'), 'gstreamer-1.0')
+plugins = []
 
 cc = meson.get_compiler('c')
+host_system = host_machine.system()
 
 if cc.get_id() == 'msvc'
-  # Ignore several spurious warnings for things gstreamer does very commonly
-  # If a warning is completely useless and spammy, use '/wdXXXX' to suppress it
-  # If a warning is harmless but hard to fix, use '/woXXXX' so it's shown once
-  # NOTE: Only add warnings here if you are sure they're spurious
-  add_project_arguments(
+  msvc_args = [
+      # Ignore several spurious warnings for things gstreamer does very commonly
+      # If a warning is completely useless and spammy, use '/wdXXXX' to suppress it
+      # If a warning is harmless but hard to fix, use '/woXXXX' so it's shown once
+      # NOTE: Only add warnings here if you are sure they're spurious
       '/wd4018', # implicit signed/unsigned conversion
       '/wd4146', # unary minus on unsigned (beware INT_MIN)
       '/wd4244', # lossy type conversion (e.g. double -> int)
       '/wd4305', # truncating type conversion (e.g. double -> float)
-      language : 'c')
+      cc.get_supported_arguments(['/utf-8']), # set the input encoding to utf-8
+
+      # Enable some warnings on MSVC to match GCC/Clang behaviour
+      '/w14062', # enumerator 'identifier' in switch of enum 'enumeration' is not handled
+      '/w14101', # 'identifier' : unreferenced local variable
+      '/w14189', # 'identifier' : local variable is initialized but not referenced
+  ]
+  if have_cxx
+    add_project_arguments(msvc_args, language: ['c', 'cpp'])
+  else
+    add_project_arguments(msvc_args, language: 'c')
+  endif
   # Disable SAFESEH with MSVC for plugins and libs that use external deps that
   # are built with MinGW
   noseh_link_args = ['/SAFESEH:NO']
@@ -56,6 +71,30 @@ endif
 # Disable strict aliasing
 if cc.has_argument('-fno-strict-aliasing')
   add_project_arguments('-fno-strict-aliasing', language: 'c')
+endif
+
+# Define G_DISABLE_DEPRECATED for development versions
+if gst_version_is_dev
+  message('Disabling deprecated GLib API')
+  add_project_arguments('-DG_DISABLE_DEPRECATED', language: 'c')
+endif
+
+cast_checks = get_option('gobject-cast-checks')
+if cast_checks.disabled() or (cast_checks.auto() and not gst_version_is_dev)
+  message('Disabling GLib cast checks')
+  add_project_arguments('-DG_DISABLE_CAST_CHECKS', language: 'c')
+endif
+
+glib_asserts = get_option('glib-asserts')
+if glib_asserts.disabled() or (glib_asserts.auto() and not gst_version_is_dev)
+  message('Disabling GLib asserts')
+  add_project_arguments('-DG_DISABLE_ASSERT', language: 'c')
+endif
+
+glib_checks = get_option('glib-checks')
+if glib_checks.disabled() or (glib_checks.auto() and not gst_version_is_dev)
+  message('Disabling GLib checks')
+  add_project_arguments('-DG_DISABLE_CHECKS', language: 'c')
 endif
 
 cdata = configuration_data()
@@ -112,7 +151,6 @@ check_functions = [
   ['HAVE_GETPAGESIZE', 'getpagesize', '#include<unistd.h>'],
 # check token HAVE_GETTEXT
 # check token HAVE_GST_V4L2
-# check token HAVE_IOS
   ['HAVE_ISINF', 'isinf', '#include<math.h>'],
 # check token HAVE_LIBV4L2
   ['HAVE_MMAP', 'mmap', '#include<sys/mman.h>'],
@@ -122,6 +160,7 @@ check_functions = [
 # check token HAVE_RDTSC
   ['HAVE_SINH', 'sinh', '#include<math.h>'],
 # check token HAVE_WAVEFORM
+  ['HAVE_GMTIME_R', 'gmtime_r', '#include<time.h>'],
 ]
 
 libm = cc.find_library('m', required : false)
@@ -131,6 +170,8 @@ foreach f : check_functions
     cdata.set(f.get(0), 1)
   endif
 endforeach
+
+cdata.set('HAVE_IOS', host_system == 'ios')
 
 cdata.set('SIZEOF_CHAR', cc.sizeof('char'))
 cdata.set('SIZEOF_INT', cc.sizeof('int'))
@@ -149,9 +190,6 @@ cdata.set_quoted('GST_LICENSE', 'LGPL')
 cdata.set_quoted('PACKAGE', 'gst-plugins-good')
 cdata.set_quoted('GETTEXT_PACKAGE', 'gst-plugins-good-1.0')
 cdata.set_quoted('LOCALEDIR', join_paths(get_option('prefix'), get_option('localedir')))
-if get_option('nls')
-  cdata.set('ENABLE_NLS', 1)
-endif
 
 warning_flags = [
   '-Wmissing-declarations',
@@ -211,13 +249,11 @@ gstbase_dep = dependency('gstreamer-base-1.0', version : gst_req,
   fallback : ['gstreamer', 'gst_base_dep'])
 gstnet_dep = dependency('gstreamer-net-1.0', version : gst_req,
   fallback : ['gstreamer', 'gst_net_dep'])
-if host_machine.system() != 'windows'
-  gstcheck_dep = dependency('gstreamer-check-1.0', version : gst_req,
-    fallback : ['gstreamer', 'gst_check_dep'])
-endif
 gstcontroller_dep = dependency('gstreamer-controller-1.0', version : gst_req,
   fallback : ['gstreamer', 'gst_controller_dep'])
-
+gstcheck_dep = dependency('gstreamer-check-1.0', version : gst_req,
+  required : get_option('tests'),
+  fallback : ['gstreamer', 'gst_check_dep'])
 gstpbutils_dep = dependency('gstreamer-pbutils-1.0', version : gst_req,
     fallback : ['gst-plugins-base', 'pbutils_dep'])
 gstallocators_dep = dependency('gstreamer-allocators-1.0', version : gst_req,
@@ -242,12 +278,17 @@ gstvideo_dep = dependency('gstreamer-video-1.0', version : gst_req,
     fallback : ['gst-plugins-base', 'video_dep'])
 
 # GStreamer OpenGL
+# FIXME: automagic
 gstgl_dep = dependency('gstreamer-gl-1.0', version : gst_req,
     fallback : ['gst-plugins-base', 'gstgl_dep'], required: false)
+gstglproto_dep = dependency('', required : false)
+gstglx11_dep = dependency('', required : false)
+gstglwayland_dep = dependency('', required : false)
+gstglegl_dep = dependency('', required : false)
 
-build_gstgl = gstgl_dep.found() # FIXME: add option?
+have_gstgl = gstgl_dep.found()
 
-if build_gstgl
+if have_gstgl
   if gstgl_dep.type_name() == 'pkgconfig'
     gst_gl_apis = gstgl_dep.get_pkgconfig_variable('gl_apis').split()
     gst_gl_winsys = gstgl_dep.get_pkgconfig_variable('gl_winsys').split()
@@ -271,46 +312,42 @@ if build_gstgl
     set_variable('gst_gl_have_platform_@0@'.format(p), gst_gl_platforms.contains(p))
   endforeach
 
-  foreach api : ['opengl', 'gles2']
+  foreach api : ['gl', 'gles2']
     set_variable('gst_gl_have_api_@0@'.format(api), gst_gl_apis.contains(api))
   endforeach
+
+  gstglproto_dep = dependency('gstreamer-gl-prototypes-1.0', version : gst_req,
+      fallback : ['gst-plugins-base', 'gstglproto_dep'], required: true)
+  # Behind specific checks because meson fails at optional dependencies with a
+  # fallback to the same subproject.  On the first failure, meson will never
+  # check the system again even if the fallback never existed.
+  # Last checked with meson 0.54.3
+  if gst_gl_have_window_x11
+    gstglx11_dep = dependency('gstreamer-gl-x11-1.0', version : gst_req,
+       fallback : ['gst-plugins-base', 'gstglx11_dep'], required: true)
+  endif
+  if gst_gl_have_window_wayland
+    gstglwayland_dep = dependency('gstreamer-gl-wayland-1.0', version : gst_req,
+        fallback : ['gst-plugins-base', 'gstglwayland_dep'], required: true)
+  endif
+  if gst_gl_have_platform_egl
+    gstglegl_dep = dependency('gstreamer-gl-egl-1.0', version : gst_req,
+        fallback : ['gst-plugins-base', 'gstglegl_dep'], required: true)
+  endif
 endif
 
 zlib_dep = dependency('zlib', required : false)
-bz2lib = cc.find_library('bz2', required : false)
+if not zlib_dep.found()
+  zlib_dep = cc.find_library('z', required : false)
+  if not zlib_dep.found() or not cc.has_header('zlib.h')
+    zlib_dep = subproject('zlib').get_variable('zlib_dep')
+  endif
+endif
+cdata.set('HAVE_ZLIB', true)
+
 glib_deps = [dependency('glib-2.0', version : glib_req, fallback: ['glib', 'libglib_dep']),
              dependency('gobject-2.0', fallback: ['glib', 'libgobject_dep'])]
 gio_dep = dependency('gio-2.0', fallback: ['glib', 'libgio_dep'])
-
-cdata.set('HAVE_ZLIB', zlib_dep.found())
-cdata.set('HAVE_BZ2', bz2lib.found())
-
-# Check all of the things.
-# TODO: None of these are actually used yet because
-# the build files haven't been written
-deps = [
-  ['gtk_dep','gtk+-3.0', '', ''],
-  ['gtkx_dep','gtk+-x11-3.0', '', ''],
-  ['caca_dep','caca', '', ''],
-  ['libraw1394_dep','libraw1394', '>=2.0.0', ''],
-  ['libiec61883_dep','libiec61883', '>=1.0.0', ''],
-]
-
-foreach d : deps
-  varname = d[0]
-  depname = d[1]
-  version = d[2]
-  confhname = d[3]
-  if version == ''
-    curdep = dependency(depname, required : false)
-  else
-    curdep = dependency(depname, required : false, version : version)
-  endif
-  set_variable(varname, curdep)
-  if curdep.found() and confhname != ''
-    cdata.set(confhname, 1)
-  endif
-endforeach
 
 gst_plugins_good_args = ['-DHAVE_CONFIG_H']
 configinc = include_directories('.')
@@ -318,49 +355,84 @@ libsinc = include_directories('gst-libs')
 
 have_orcc = false
 orcc_args = []
-if get_option('orc') != 'no'
-  need_orc = get_option('orc') == 'yes'
-  # Used by various libraries/elements that use Orc code
-  orc_dep = dependency('orc-0.4', version : '>= 0.4.17', required : need_orc)
-  orcc = find_program('orcc', required : need_orc)
-  if orc_dep.found() and orcc.found()
-    have_orcc = true
-    orcc_args = [orcc, '--include', 'glib.h']
-    cdata.set('HAVE_ORC', 1)
-  else
-    message('Orc Compiler not found, will use backup C code')
-    cdata.set('DISABLE_ORC', 1)
-  endif
+orc_targets = []
+# Used by various libraries/elements that use Orc code
+orc_dep = dependency('orc-0.4', version : orc_req, required : get_option('orc'),
+    fallback : ['orc', 'orc_dep'])
+orcc = find_program('orcc', required : get_option('orc'))
+if orc_dep.found() and orcc.found()
+  have_orcc = true
+  orcc_args = [orcc, '--include', 'glib.h']
+  cdata.set('HAVE_ORC', 1)
 else
+  message('Orc Compiler not found, will use backup C code')
   cdata.set('DISABLE_ORC', 1)
 endif
 
-if gst_dep.type_name() == 'internal'
-    gst_proj = subproject('gstreamer')
+have_nasm = false
+# FIXME: nasm path needs testing on non-Linux, esp. Windows
+host_cpu = host_machine.cpu_family()
+if host_cpu == 'x86_64'
+  if cc.get_define('__ILP32__') == '1'
+    message('Nasm disabled on x32')
+  else
+    asm_option = get_option('asm')
+    nasm = find_program('nasm', native: true, required: asm_option)
+    if nasm.found()
+      # We can't use the version: kwarg for find_program because old versions
+      # of nasm don't support --version
+      ret = run_command(nasm, '-v')
+      if ret.returncode() == 0
+        nasm_version = ret.stdout().strip().split()[2]
+        nasm_req = '>=2.13'
+        if nasm_version.version_compare(nasm_req)
+          message('nasm found on x86-64')
+          cdata.set('HAVE_NASM', 1)
+          have_nasm = true
+        else
+          if asm_option.enabled()
+            error('asm option is enabled, and nasm @0@ was found, but @1@ is required'.format(nasm_version, nasm_req))
+          endif
+          message('nasm @0@ was found, but @1@ is required'.format(nasm_version, nasm_req))
+        endif
+      else
+        if asm_option.enabled()
+          error('asm option is enabled, but nasm is not usable: @0@\n@1@'.format(ret.stdout(), ret.stderr()))
+        endif
+        message('nasm was found, but it\'s not usable')
+      endif
+      # Unset nasm to not be 'found'
+      if not have_nasm
+        nasm = disabler()
+      endif
+    endif
+  endif
+endif
 
-    if not gst_proj.get_variable('gst_debug')
-        message('GStreamer debug system is disabled')
-        add_project_arguments('-Wno-unused', language: 'c')
-    else
-        message('GStreamer debug system is enabled')
-    endif
+# Disable compiler warnings for unused variables and args if gst debug system is disabled
+if gst_dep.type_name() == 'internal'
+  gst_debug_disabled = not subproject('gstreamer').get_variable('gst_debug')
 else
-    # We can't check that in the case of subprojects as we won't
-    # be able to build against an internal dependency (which is not built yet)
-    if not cc.compiles('''
-#include <gst/gstconfig.h>
-#ifdef GST_DISABLE_GST_DEBUG
-#error "debugging disabled, make compiler fail"
-#endif''' , dependencies: gst_dep)
-        message('GStreamer debug system is disabled')
-        add_project_arguments('-Wno-unused', language: 'c')
-    else
-        message('GStreamer debug system is enabled')
-    endif
+  # We can't check that in the case of subprojects as we won't
+  # be able to build against an internal dependency (which is not built yet)
+  gst_debug_disabled = cc.has_header_symbol('gst/gstconfig.h', 'GST_DISABLE_GST_DEBUG', dependencies: gst_dep)
+endif
+
+if gst_debug_disabled
+  message('GStreamer debug system is disabled')
+  if cc.has_argument('-Wno-unused')
+    add_project_arguments('-Wno-unused', language: 'c')
+  endif
+  if have_cxx and cxx.has_argument ('-Wno-unused')
+    add_project_arguments('-Wno-unused', language: 'cpp')
+  endif
+else
+  message('GStreamer debug system is enabled')
 endif
 
 presetdir = join_paths(get_option('datadir'), 'gstreamer-' + api_version, 'presets')
 
+python3 = import('python').find_installation()
 pkgconfig = import('pkgconfig')
 plugins_pkgconfig_install_dir = join_paths(plugins_install_dir, 'pkgconfig')
 if get_option('default_library') == 'shared'
@@ -372,14 +444,72 @@ subdir('gst')
 subdir('sys')
 subdir('ext')
 subdir('tests')
-subdir('pkgconfig')
+subdir('docs')
+
+if have_orcc and orc_targets.length() > 0
+  update_orc_dist_files = find_program('scripts/update-orc-dist-files.py')
+
+  orc_update_targets = []
+  foreach t : orc_targets
+    orc_name = t.get('name')
+    orc_file = t.get('orc-source')
+    header = t.get('header')
+    source = t.get('source')
+    # alias_target() only works with build targets, so can't use run_target() here
+    orc_update_targets += [
+      custom_target('update-orc-@0@'.format(orc_name),
+        input: [header, source],
+        command: [update_orc_dist_files, orc_file, header, source],
+        output: ['@0@-dist.c'.format(orc_name)]) # not entirely true
+    ]
+  endforeach
+
+  if meson.version().version_compare('>= 0.52')
+    update_orc_dist_target = alias_target('update-orc-dist', orc_update_targets)
+  endif
+endif
 
 # xgettext is optional (on Windows for instance)
-if get_option('nls') and find_program('xgettext', required : false).found()
+if find_program('xgettext', required : get_option('nls')).found()
+  cdata.set('ENABLE_NLS', 1)
   subdir('po')
+endif
+
+subdir('scripts')
+
+# Set release date
+if gst_version_nano == 0
+  extract_release_date = find_program('scripts/extract-release-date-from-doap-file.py')
+  run_result = run_command(extract_release_date, gst_version, files('gst-plugins-good.doap'))
+  if run_result.returncode() == 0
+    release_date = run_result.stdout().strip()
+    cdata.set_quoted('GST_PACKAGE_RELEASE_DATETIME', release_date)
+    message('Package release date: ' + release_date)
+  else
+    # Error out if our release can't be found in the .doap file
+    error(run_result.stderr())
+  endif
+endif
+
+if gio_dep.version().version_compare('< 2.67.4')
+  cdata.set('g_memdup2(ptr,sz)', '(G_LIKELY(((guint64)(sz)) < G_MAXUINT)) ? g_memdup(ptr,sz) : (g_abort(),NULL)')
 endif
 
 configure_file(output : 'config.h', configuration : cdata)
 
-python3 = import('python3').find_python()
 run_command(python3, '-c', 'import shutil; shutil.copy("hooks/pre-commit.hook", ".git/hooks/pre-commit")')
+
+if meson.version().version_compare('>= 0.54')
+  plugin_names = []
+  foreach plugin: plugins
+    # FIXME: Use str.subtring() when we can depend on Meson 0.56
+    split = plugin.name().split('gst')
+    if split.length() == 2
+      plugin_names += [split[1]]
+    else
+      warning('Need substring API in meson >= 0.56 to properly parse plugin name: ' + plugin.name())
+      plugin_names += [plugin.name()]
+    endif
+  endforeach
+  summary({'Plugins':plugin_names}, list_sep: ', ')
+endif

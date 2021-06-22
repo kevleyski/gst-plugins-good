@@ -18,20 +18,20 @@
  */
 /**
  * SECTION:element-gstsouphttpclientsink
+ * @title: gstsouphttpclientsink
  *
  * The souphttpclientsink element sends pipeline data to an HTTP server
  * using HTTP PUT commands.
  *
- * <refsect2>
- * <title>Example launch line</title>
+ * ## Example launch line
  * |[
  * gst-launch-1.0 -v videotestsrc num-buffers=300 ! theoraenc ! oggmux !
  *   souphttpclientsink location=http://server/filename.ogv
  * ]|
- * 
+ *
  * This example encodes 10 seconds of video and sends it to the HTTP
  * server "server" using HTTP PUT commands.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -40,6 +40,7 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstbasesink.h>
+#include "gstsoupelements.h"
 #include "gstsouphttpclientsink.h"
 #include "gstsouputils.h"
 
@@ -114,6 +115,8 @@ GST_STATIC_PAD_TEMPLATE ("sink",
 #define gst_soup_http_client_sink_parent_class parent_class
 G_DEFINE_TYPE (GstSoupHttpClientSink, gst_soup_http_client_sink,
     GST_TYPE_BASE_SINK);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (souphttpclientsink, "souphttpclientsink",
+    GST_RANK_NONE, GST_TYPE_SOUP_HTTP_CLIENT_SINK, soup_element_init (plugin));
 
 static void
 gst_soup_http_client_sink_class_init (GstSoupHttpClientSinkClass * klass)

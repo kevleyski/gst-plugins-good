@@ -32,6 +32,7 @@
 #include <gst/rtp/gstrtppayloads.h>
 #include <gst/rtp/gstrtpbuffer.h>
 #include <gst/video/video.h>
+#include "gstrtpelements.h"
 #include "dboolhuff.h"
 #include "gstrtpvp9pay.h"
 #include "gstrtputils.h"
@@ -78,6 +79,8 @@ static gboolean gst_rtp_vp9_pay_set_caps (GstRTPBasePayload * payload,
     GstCaps * caps);
 
 G_DEFINE_TYPE (GstRtpVP9Pay, gst_rtp_vp9_pay, GST_TYPE_RTP_BASE_PAYLOAD);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (rtpvp9pay, "rtpvp9pay",
+    GST_RANK_MARGINAL, GST_TYPE_RTP_VP9_PAY, rtp_element_init (plugin));
 
 static GstStaticPadTemplate gst_rtp_vp9_pay_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
@@ -135,6 +138,8 @@ gst_rtp_vp9_pay_class_init (GstRtpVP9PayClass * gst_rtp_vp9_pay_class)
 
   GST_DEBUG_CATEGORY_INIT (gst_rtp_vp9_pay_debug, "rtpvp9pay", 0,
       "VP9 Video RTP Payloader");
+
+  gst_type_mark_as_plugin_api (GST_TYPE_RTP_VP9_PAY_PICTURE_ID_MODE, 0);
 }
 
 static void
@@ -384,7 +389,9 @@ gst_rtp_vp9_create_header_buffer (GstRtpVP9Pay * self,
   guint off = 1;
   guint hdrlen = gst_rtp_vp9_calc_header_len (self, start);
 
-  out = gst_rtp_buffer_new_allocate (hdrlen, 0, 0);
+  out =
+      gst_rtp_base_payload_allocate_output_buffer (GST_RTP_BASE_PAYLOAD (self),
+      hdrlen, 0, 0);
   gst_rtp_buffer_map (out, GST_MAP_READWRITE, &rtpbuffer);
   p = gst_rtp_buffer_get_payload (&rtpbuffer);
   p[0] = 0x0;
@@ -527,30 +534,30 @@ static gboolean
 gst_rtp_vp9_pay_set_caps (GstRTPBasePayload * payload, GstCaps * caps)
 {
   GstCaps *src_caps;
-  GstStructure *s;
-  char *encoding_name;
+  const char *encoding_name = "VP9";
 
   src_caps = gst_pad_get_allowed_caps (GST_RTP_BASE_PAYLOAD_SRCPAD (payload));
   if (src_caps) {
-    src_caps = gst_caps_make_writable (src_caps);
-    src_caps = gst_caps_truncate (src_caps);
+    GstStructure *s;
+    const GValue *value;
+
     s = gst_caps_get_structure (src_caps, 0);
-    gst_structure_fixate_field_string (s, "encoding-name", "VP9");
-    encoding_name = g_strdup (gst_structure_get_string (s, "encoding-name"));
+
+    if (gst_structure_has_field (s, "encoding-name")) {
+      GValue default_value = G_VALUE_INIT;
+
+      g_value_init (&default_value, G_TYPE_STRING);
+      g_value_set_static_string (&default_value, encoding_name);
+
+      value = gst_structure_get_value (s, "encoding-name");
+      if (!gst_value_can_intersect (&default_value, value))
+        encoding_name = "VP9-DRAFT-IETF-01";
+    }
     gst_caps_unref (src_caps);
-  } else {
-    encoding_name = g_strdup ("VP9-DRAFT-IETF-01");
   }
 
   gst_rtp_base_payload_set_options (payload, "video", TRUE,
       encoding_name, 90000);
-  g_free (encoding_name);
-  return gst_rtp_base_payload_set_outcaps (payload, NULL);
-}
 
-gboolean
-gst_rtp_vp9_pay_plugin_init (GstPlugin * plugin)
-{
-  return gst_element_register (plugin, "rtpvp9pay",
-      GST_RANK_MARGINAL, GST_TYPE_RTP_VP9_PAY);
+  return gst_rtp_base_payload_set_outcaps (payload, NULL);
 }

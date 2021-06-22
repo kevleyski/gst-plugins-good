@@ -198,9 +198,12 @@ struct _RTPSource {
 
   gboolean     send_nack;
   GArray      *nacks;
+  GArray      *nack_deadlines;
 
   gboolean      pt_set;
   guint8        pt;
+
+  gboolean      disable_rtcp;
 };
 
 struct _RTPSourceClass {
@@ -246,7 +249,7 @@ GstFlowReturn   rtp_source_send_rtp            (RTPSource *src, RTPPacketInfo *p
 /* RTCP messages */
 void            rtp_source_process_sr          (RTPSource *src, GstClockTime time, guint64 ntptime,
                                                 guint32 rtptime, guint32 packet_count, guint32 octet_count);
-void            rtp_source_process_rb          (RTPSource *src, guint64 ntpnstime, guint8 fractionlost,
+void            rtp_source_process_rb          (RTPSource *src, guint32 ssrc, guint64 ntpnstime, guint8 fractionlost,
                                                 gint32 packetslost, guint32 exthighestseq, guint32 jitter,
                                                 guint32 lsr, guint32 dlsr);
 
@@ -260,7 +263,7 @@ gboolean        rtp_source_get_new_rb          (RTPSource *src, GstClockTime tim
 gboolean        rtp_source_get_last_sr         (RTPSource *src, GstClockTime *time, guint64 *ntptime,
                                                 guint32 *rtptime, guint32 *packet_count,
 						guint32 *octet_count);
-gboolean        rtp_source_get_last_rb         (RTPSource *src, guint8 *fractionlost, gint32 *packetslost,
+gboolean        rtp_source_get_last_rb         (RTPSource *src, guint32 * ssrc, guint8 *fractionlost, gint32 *packetslost,
                                                 guint32 *exthighestseq, guint32 *jitter,
                                                 guint32 *lsr, guint32 *dlsr, guint32 *round_trip);
 
@@ -288,6 +291,7 @@ void            rtp_conflicting_address_free   (RTPConflictingAddress * addr);
 
 void            rtp_source_timeout             (RTPSource * src,
                                                 GstClockTime current_time,
+                                                GstClockTime running_time,
                                                 GstClockTime feedback_retention_window);
 
 void            rtp_source_retain_rtcp_packet  (RTPSource * src,
@@ -298,8 +302,10 @@ gboolean        rtp_source_has_retained        (RTPSource * src,
                                                 gconstpointer data);
 
 void            rtp_source_register_nack       (RTPSource * src,
-                                                guint16 seqnum);
-guint32 *       rtp_source_get_nacks           (RTPSource * src, guint *n_nacks);
-void            rtp_source_clear_nacks         (RTPSource * src);
+                                                guint16 seqnum,
+                                                GstClockTime deadline);
+guint16 *       rtp_source_get_nacks           (RTPSource * src, guint *n_nacks);
+GstClockTime *  rtp_source_get_nack_deadlines  (RTPSource * src, guint *n_nacks);
+void            rtp_source_clear_nacks         (RTPSource * src, guint n_nacks);
 
 #endif /* __RTP_SOURCE_H__ */

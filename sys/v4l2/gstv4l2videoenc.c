@@ -45,6 +45,7 @@ typedef struct
   gchar *device;
   GstCaps *sink_caps;
   GstCaps *src_caps;
+  const GstV4l2Codec *codec;
 } GstV4l2VideoEncCData;
 
 enum
@@ -109,11 +110,12 @@ static gboolean
 gst_v4l2_video_enc_open (GstVideoEncoder * encoder)
 {
   GstV4l2VideoEnc *self = GST_V4L2_VIDEO_ENC (encoder);
+  GstV4l2Error error = GST_V4L2_ERROR_INIT;
   GstCaps *codec_caps;
 
   GST_DEBUG_OBJECT (self, "Opening");
 
-  if (!gst_v4l2_object_open (self->v4l2output))
+  if (!gst_v4l2_object_open (self->v4l2output, &error))
     goto failure;
 
   if (!gst_v4l2_object_open_shared (self->v4l2capture, self->v4l2output))
@@ -157,6 +159,8 @@ failure:
 
   gst_caps_replace (&self->probed_srccaps, NULL);
   gst_caps_replace (&self->probed_sinkcaps, NULL);
+
+  gst_v4l2_error (self, &error);
 
   return FALSE;
 }
@@ -274,6 +278,7 @@ gst_v4l2_video_enc_finish (GstVideoEncoder * encoder)
     GstTask *task = encoder->srcpad->task;
 
     /* Wait for the task to be drained */
+    GST_DEBUG_OBJECT (self, "Waiting for encoder stop");
     GST_OBJECT_LOCK (task);
     while (GST_TASK_STATE (task) == GST_TASK_STARTED)
       GST_TASK_WAIT (task);
@@ -282,7 +287,7 @@ gst_v4l2_video_enc_finish (GstVideoEncoder * encoder)
   }
 
   /* and ensure the processing thread has stopped in case another error
-   * occured. */
+   * occurred. */
   gst_v4l2_object_unlock (self->v4l2capture);
   gst_pad_stop_task (encoder->srcpad);
   GST_VIDEO_ENCODER_STREAM_LOCK (encoder);
@@ -334,14 +339,6 @@ gst_v4l2_video_enc_set_format (GstVideoEncoder * encoder,
 
   if (!gst_v4l2_object_set_format (self->v4l2output, state->caps, &error)) {
     gst_v4l2_error (self, &error);
-    return FALSE;
-  }
-
-  /* activating a capture pool will also call STREAMON. CODA driver will
-   * refuse to configure the output if the capture is stremaing. */
-  if (!gst_buffer_pool_set_active (GST_BUFFER_POOL (self->v4l2capture->pool),
-          TRUE)) {
-    GST_WARNING_OBJECT (self, "Could not activate capture buffer pool.");
     return FALSE;
   }
 
@@ -426,8 +423,9 @@ negotiate_profile_and_level (GstCapsFeatures * features, GstStructure * s,
   GQueue profiles = G_QUEUE_INIT;
   GQueue levels = G_QUEUE_INIT;
   gboolean failed = FALSE;
+  const GstV4l2Codec *codec = klass->codec;
 
-  if (klass->profile_cid && get_string_list (s, "profile", &profiles)) {
+  if (codec->profile_cid && get_string_list (s, "profile", &profiles)) {
     GList *l;
 
     for (l = profiles.head; l; l = l->next) {
@@ -437,8 +435,9 @@ negotiate_profile_and_level (GstCapsFeatures * features, GstStructure * s,
 
       GST_TRACE_OBJECT (ctx->self, "Trying profile %s", profile);
 
-      control.id = klass->profile_cid;
-      control.value = v4l2_profile = klass->profile_from_string (profile);
+      control.id = codec->profile_cid;
+
+      control.value = v4l2_profile = codec->profile_from_string (profile);
 
       if (control.value < 0)
         continue;
@@ -449,7 +448,7 @@ negotiate_profile_and_level (GstCapsFeatures * features, GstStructure * s,
         break;
       }
 
-      profile = klass->profile_to_string (control.value);
+      profile = codec->profile_to_string (control.value);
 
       if (control.value == v4l2_profile) {
         ctx->profile = profile;
@@ -469,7 +468,7 @@ negotiate_profile_and_level (GstCapsFeatures * features, GstStructure * s,
     g_queue_clear (&profiles);
   }
 
-  if (!failed && klass->level_cid && get_string_list (s, "level", &levels)) {
+  if (!failed && codec->level_cid && get_string_list (s, "level", &levels)) {
     GList *l;
 
     for (l = levels.head; l; l = l->next) {
@@ -479,8 +478,8 @@ negotiate_profile_and_level (GstCapsFeatures * features, GstStructure * s,
 
       GST_TRACE_OBJECT (ctx->self, "Trying level %s", level);
 
-      control.id = klass->level_cid;
-      control.value = v4l2_level = klass->level_from_string (level);
+      control.id = codec->level_cid;
+      control.value = v4l2_level = codec->level_from_string (level);
 
       if (control.value < 0)
         continue;
@@ -491,7 +490,7 @@ negotiate_profile_and_level (GstCapsFeatures * features, GstStructure * s,
         break;
       }
 
-      level = klass->level_to_string (control.value);
+      level = codec->level_to_string (control.value);
 
       if (control.value == v4l2_level) {
         ctx->level = level;
@@ -525,9 +524,17 @@ gst_v4l2_video_enc_negotiate (GstVideoEncoder * encoder)
   struct ProfileLevelCtx ctx = { self, NULL, NULL };
   GstVideoCodecState *state;
   GstStructure *s;
+  const GstV4l2Codec *codec = klass->codec;
 
   GST_DEBUG_OBJECT (self, "Negotiating %s profile and level.",
       klass->codec_name);
+
+  /* Only renegotiate on upstream changes */
+  if (self->input_state)
+    return TRUE;
+
+  if (!codec)
+    goto done;
 
   allowed_caps = gst_pad_get_allowed_caps (GST_VIDEO_ENCODER_SRC_PAD (encoder));
 
@@ -544,28 +551,31 @@ gst_v4l2_video_enc_negotiate (GstVideoEncoder * encoder)
     if (gst_caps_foreach (allowed_caps, negotiate_profile_and_level, &ctx)) {
       goto no_profile_level;
     }
+
+    gst_caps_unref (allowed_caps);
+    allowed_caps = NULL;
   }
 
-  if (klass->profile_cid && !ctx.profile) {
+  if (codec->profile_cid && !ctx.profile) {
     struct v4l2_control control = { 0, };
 
-    control.id = klass->profile_cid;
+    control.id = codec->profile_cid;
 
     if (v4l2object->ioctl (v4l2object->video_fd, VIDIOC_G_CTRL, &control) < 0)
       goto g_ctrl_failed;
 
-    ctx.profile = klass->profile_to_string (control.value);
+    ctx.profile = codec->profile_to_string (control.value);
   }
 
-  if (klass->level_cid && !ctx.level) {
+  if (codec->level_cid && !ctx.level) {
     struct v4l2_control control = { 0, };
 
-    control.id = klass->level_cid;
+    control.id = codec->level_cid;
 
     if (v4l2object->ioctl (v4l2object->video_fd, VIDIOC_G_CTRL, &control) < 0)
       goto g_ctrl_failed;
 
-    ctx.level = klass->level_to_string (control.value);
+    ctx.level = codec->level_to_string (control.value);
   }
 
   GST_DEBUG_OBJECT (self, "Selected %s profile %s at level %s",
@@ -574,12 +584,13 @@ gst_v4l2_video_enc_negotiate (GstVideoEncoder * encoder)
   state = gst_video_encoder_get_output_state (encoder);
   s = gst_caps_get_structure (state->caps, 0);
 
-  if (klass->profile_cid)
+  if (codec->profile_cid)
     gst_structure_set (s, "profile", G_TYPE_STRING, ctx.profile, NULL);
 
-  if (klass->level_cid)
+  if (codec->level_cid)
     gst_structure_set (s, "level", G_TYPE_STRING, ctx.level, NULL);
 
+done:
   if (!GST_VIDEO_ENCODER_CLASS (parent_class)->negotiate (encoder))
     return FALSE;
 
@@ -601,35 +612,20 @@ not_negotiated:
   return FALSE;
 }
 
-static GstVideoCodecFrame *
-gst_v4l2_video_enc_get_oldest_frame (GstVideoEncoder * encoder)
+static gboolean
+check_system_frame_number_too_old (guint32 current, guint32 old)
 {
-  GstVideoCodecFrame *frame = NULL;
-  GList *frames, *l;
-  gint count = 0;
+  guint32 absdiff = current > old ? current - old : old - current;
 
-  frames = gst_video_encoder_get_frames (encoder);
-
-  for (l = frames; l != NULL; l = l->next) {
-    GstVideoCodecFrame *f = l->data;
-
-    if (!frame || frame->pts > f->pts)
-      frame = f;
-
-    count++;
+  /* More than 100 frames in the past, or current wrapped around */
+  if (absdiff > 100) {
+    /* Wraparound and difference is actually smaller than 100 */
+    if (absdiff > G_MAXUINT32 - 100)
+      return FALSE;
+    return TRUE;
   }
 
-  if (frame) {
-    GST_LOG_OBJECT (encoder,
-        "Oldest frame is %d %" GST_TIME_FORMAT
-        " and %d frames left",
-        frame->system_frame_number, GST_TIME_ARGS (frame->pts), count - 1);
-    gst_video_codec_frame_ref (frame);
-  }
-
-  g_list_free_full (frames, (GDestroyNotify) gst_video_codec_frame_unref);
-
-  return frame;
+  return FALSE;
 }
 
 static void
@@ -650,20 +646,54 @@ gst_v4l2_video_enc_loop (GstVideoEncoder * encoder)
     goto beach;
   }
 
-
   /* FIXME Check if buffer isn't the last one here */
 
   GST_LOG_OBJECT (encoder, "Process output buffer");
   ret =
       gst_v4l2_buffer_pool_process (GST_V4L2_BUFFER_POOL
-      (self->v4l2capture->pool), &buffer);
+      (self->v4l2capture->pool), &buffer, NULL);
 
   if (ret != GST_FLOW_OK)
     goto beach;
 
-  frame = gst_v4l2_video_enc_get_oldest_frame (encoder);
+  if (GST_BUFFER_TIMESTAMP (buffer) % GST_SECOND != 0)
+    GST_ERROR_OBJECT (encoder,
+        "Driver bug detected - check driver with v4l2-compliance from http://git.linuxtv.org/v4l-utils.git");
+  GST_LOG_OBJECT (encoder, "Got buffer for frame number %u",
+      (guint32) (GST_BUFFER_PTS (buffer) / GST_SECOND));
+  frame =
+      gst_video_encoder_get_frame (encoder,
+      GST_BUFFER_TIMESTAMP (buffer) / GST_SECOND);
 
   if (frame) {
+    GstVideoCodecFrame *oldest_frame;
+    gboolean warned = FALSE;
+
+    /* Garbage collect old frames in case of codec bugs */
+    while ((oldest_frame = gst_video_encoder_get_oldest_frame (encoder)) &&
+        check_system_frame_number_too_old (frame->system_frame_number,
+            oldest_frame->system_frame_number)) {
+      gst_video_encoder_finish_frame (encoder, oldest_frame);
+      oldest_frame = NULL;
+
+      if (!warned) {
+        g_warning ("%s: Too old frames, bug in encoder -- please file a bug",
+            GST_ELEMENT_NAME (encoder));
+        warned = TRUE;
+      }
+    }
+    if (oldest_frame)
+      gst_video_codec_frame_unref (oldest_frame);
+
+    /* At this point, the delta unit buffer flag is already correctly set by
+     * gst_v4l2_buffer_pool_process. Since gst_video_encoder_finish_frame
+     * will overwrite it from GST_VIDEO_CODEC_FRAME_IS_SYNC_POINT (frame),
+     * set that here.
+     */
+    if (GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT))
+      GST_VIDEO_CODEC_FRAME_UNSET_SYNC_POINT (frame);
+    else
+      GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
     frame->output_buffer = buffer;
     buffer = NULL;
     ret = gst_video_encoder_finish_frame (encoder, frame);
@@ -714,14 +744,17 @@ gst_v4l2_video_enc_handle_frame (GstVideoEncoder * encoder,
   if (G_UNLIKELY (!g_atomic_int_get (&self->active)))
     goto flushing;
 
-  task_state = gst_pad_get_task_state (GST_VIDEO_DECODER_SRC_PAD (self));
+  task_state = gst_pad_get_task_state (GST_VIDEO_ENCODER_SRC_PAD (self));
   if (task_state == GST_TASK_STOPPED || task_state == GST_TASK_PAUSED) {
     GstBufferPool *pool = GST_BUFFER_POOL (self->v4l2output->pool);
 
-    /* It possible that the processing thread stopped due to an error */
+    /* It is possible that the processing thread stopped due to an error or
+     * when the last buffer has been met during the draining process. */
     if (self->output_flow != GST_FLOW_OK &&
-        self->output_flow != GST_FLOW_FLUSHING) {
-      GST_DEBUG_OBJECT (self, "Processing loop stopped with error, leaving");
+        self->output_flow != GST_FLOW_FLUSHING &&
+        self->output_flow != GST_V4L2_FLOW_LAST_BUFFER) {
+      GST_DEBUG_OBJECT (self, "Processing loop stopped with error: %s, leaving",
+          gst_flow_get_name (self->output_flow));
       ret = self->output_flow;
       goto drop;
     }
@@ -729,7 +762,8 @@ gst_v4l2_video_enc_handle_frame (GstVideoEncoder * encoder,
     /* Ensure input internal pool is active */
     if (!gst_buffer_pool_is_active (pool)) {
       GstStructure *config = gst_buffer_pool_get_config (pool);
-      guint min = MAX (self->v4l2output->min_buffers, GST_V4L2_MIN_BUFFERS);
+      guint min = MAX (self->v4l2output->min_buffers,
+          GST_V4L2_MIN_BUFFERS (self->v4l2output));
 
       gst_buffer_pool_config_set_params (config, self->input_state->caps,
           self->v4l2output->info.size, min, min);
@@ -740,6 +774,12 @@ gst_v4l2_video_enc_handle_frame (GstVideoEncoder * encoder,
 
       if (!gst_buffer_pool_set_active (pool, TRUE))
         goto activate_failed;
+    }
+
+    if (!gst_buffer_pool_set_active
+        (GST_BUFFER_POOL (self->v4l2capture->pool), TRUE)) {
+      GST_WARNING_OBJECT (self, "Could not activate capture buffer pool.");
+      goto activate_failed;
     }
 
     GST_DEBUG_OBJECT (self, "Starting encoding thread");
@@ -754,14 +794,16 @@ gst_v4l2_video_enc_handle_frame (GstVideoEncoder * encoder,
 
   if (frame->input_buffer) {
     GST_VIDEO_ENCODER_STREAM_UNLOCK (encoder);
+    GST_LOG_OBJECT (encoder, "Passing buffer with frame number %u",
+        frame->system_frame_number);
     ret =
-        gst_v4l2_buffer_pool_process (GST_V4L2_BUFFER_POOL
-        (self->v4l2output->pool), &frame->input_buffer);
+        gst_v4l2_buffer_pool_process (GST_V4L2_BUFFER_POOL (self->
+            v4l2output->pool), &frame->input_buffer,
+        &frame->system_frame_number);
     GST_VIDEO_ENCODER_STREAM_LOCK (encoder);
 
     if (ret == GST_FLOW_FLUSHING) {
-      if (gst_pad_get_task_state (GST_VIDEO_DECODER_SRC_PAD (self)) !=
-          GST_TASK_STARTED)
+      if (gst_pad_get_task_state (encoder->srcpad) != GST_TASK_STARTED)
         ret = self->output_flow;
       goto drop;
     } else if (ret != GST_FLOW_OK) {
@@ -815,6 +857,7 @@ gst_v4l2_video_enc_decide_allocation (GstVideoEncoder *
 {
   GstV4l2VideoEnc *self = GST_V4L2_VIDEO_ENC (encoder);
   GstVideoCodecState *state = gst_video_encoder_get_output_state (encoder);
+  GstCaps *caps;
   GstV4l2Error error = GST_V4L2_ERROR_INIT;
   GstClockTime latency;
   gboolean ret = FALSE;
@@ -823,11 +866,15 @@ gst_v4l2_video_enc_decide_allocation (GstVideoEncoder *
    * GstVideoEncoder have set the width, height and framerate into the state
    * caps. These are needed by the driver to calculate the buffer size and to
    * implement bitrate adaptation. */
-  if (!gst_v4l2_object_set_format (self->v4l2capture, state->caps, &error)) {
+  caps = gst_caps_copy (state->caps);
+  gst_structure_remove_field (gst_caps_get_structure (caps, 0), "colorimetry");
+  if (!gst_v4l2_object_set_format (self->v4l2capture, caps, &error)) {
     gst_v4l2_error (self, &error);
+    gst_caps_unref (caps);
     ret = FALSE;
     goto done;
   }
+  gst_caps_unref (caps);
 
   if (gst_v4l2_object_decide_allocation (self->v4l2capture, query)) {
     GstVideoEncoderClass *enc_class = GST_VIDEO_ENCODER_CLASS (parent_class);
@@ -835,12 +882,16 @@ gst_v4l2_video_enc_decide_allocation (GstVideoEncoder *
   }
 
   /* FIXME This may not be entirely correct, as encoder may keep some
-   * observation withouth delaying the encoding. Linux Media API need some
+   * observation without delaying the encoding. Linux Media API need some
    * more work to explicitly expressed the decoder / encoder latency. This
    * value will then become max latency, and the reported driver latency would
    * become the min latency. */
+  if (!GST_CLOCK_TIME_IS_VALID (self->v4l2capture->duration))
+    self->v4l2capture->duration = gst_util_uint64_scale_int (GST_SECOND, 1, 25);
   latency = self->v4l2capture->min_buffers * self->v4l2capture->duration;
   gst_video_encoder_set_latency (encoder, latency, latency);
+  GST_DEBUG_OBJECT (self, "Setting latency: %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (latency));
 
 done:
   gst_video_codec_state_unref (state);
@@ -956,8 +1007,9 @@ gst_v4l2_video_enc_sink_event (GstVideoEncoder * encoder, GstEvent * event)
 {
   GstV4l2VideoEnc *self = GST_V4L2_VIDEO_ENC (encoder);
   gboolean ret;
+  GstEventType type = GST_EVENT_TYPE (event);
 
-  switch (GST_EVENT_TYPE (event)) {
+  switch (type) {
     case GST_EVENT_FLUSH_START:
       GST_DEBUG_OBJECT (self, "flush start");
       gst_v4l2_object_unlock (self->v4l2output);
@@ -969,7 +1021,7 @@ gst_v4l2_video_enc_sink_event (GstVideoEncoder * encoder, GstEvent * event)
 
   ret = GST_VIDEO_ENCODER_CLASS (parent_class)->sink_event (encoder, event);
 
-  switch (GST_EVENT_TYPE (event)) {
+  switch (type) {
     case GST_EVENT_FLUSH_START:
       gst_pad_stop_task (encoder->srcpad);
       GST_DEBUG_OBJECT (self, "flush start done");
@@ -1104,8 +1156,8 @@ gst_v4l2_video_enc_subclass_init (gpointer g_class, gpointer data)
   GstV4l2VideoEncCData *cdata = data;
 
   klass->default_device = cdata->device;
+  klass->codec = cdata->codec;
 
-  /* Note: gst_pad_template_new() take the floating ref from the caps */
   gst_element_class_add_pad_template (element_class,
       gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
           cdata->sink_caps));
@@ -1142,8 +1194,9 @@ gst_v4l2_is_video_enc (GstCaps * sink_caps, GstCaps * src_caps,
 
 void
 gst_v4l2_video_enc_register (GstPlugin * plugin, GType type,
-    const char *codec, const gchar * basename, const gchar * device_path,
-    GstCaps * sink_caps, GstCaps * codec_caps, GstCaps * src_caps)
+    const char *codec_name, const gchar * basename, const gchar * device_path,
+    const GstV4l2Codec * codec, gint video_fd, GstCaps * sink_caps,
+    GstCaps * codec_caps, GstCaps * src_caps)
 {
   GstCaps *filtered_caps;
   GTypeQuery type_query;
@@ -1151,13 +1204,27 @@ gst_v4l2_video_enc_register (GstPlugin * plugin, GType type,
   GType subtype;
   gchar *type_name;
   GstV4l2VideoEncCData *cdata;
+  GValue value = G_VALUE_INIT;
 
   filtered_caps = gst_caps_intersect (src_caps, codec_caps);
+
+  if (codec != NULL && video_fd != -1) {
+    if (gst_v4l2_codec_probe_levels (codec, video_fd, &value)) {
+      gst_caps_set_value (filtered_caps, "level", &value);
+      g_value_unset (&value);
+    }
+
+    if (gst_v4l2_codec_probe_profiles (codec, video_fd, &value)) {
+      gst_caps_set_value (filtered_caps, "profile", &value);
+      g_value_unset (&value);
+    }
+  }
 
   cdata = g_new0 (GstV4l2VideoEncCData, 1);
   cdata->device = g_strdup (device_path);
   cdata->sink_caps = gst_caps_ref (sink_caps);
   cdata->src_caps = gst_caps_ref (filtered_caps);
+  cdata->codec = codec;
 
   g_type_query (type, &type_query);
   memset (&type_info, 0, sizeof (type_info));
@@ -1171,11 +1238,11 @@ gst_v4l2_video_enc_register (GstPlugin * plugin, GType type,
    * v4l2h264enc, for any additional encoders, we create unique names. Encoder
    * names may change between boots, so this should help gain stable names for
    * the most common use cases. */
-  type_name = g_strdup_printf ("v4l2%senc", codec);
+  type_name = g_strdup_printf ("v4l2%senc", codec_name);
 
   if (g_type_from_name (type_name) != 0) {
     g_free (type_name);
-    type_name = g_strdup_printf ("v4l2%s%senc", basename, codec);
+    type_name = g_strdup_printf ("v4l2%s%senc", basename, codec_name);
   }
 
   subtype = g_type_register_static (type, type_name, &type_info, 0);

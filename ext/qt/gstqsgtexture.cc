@@ -35,7 +35,7 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 
 GstQSGTexture::GstQSGTexture ()
 {
-  static volatile gsize _debug;
+  static gsize _debug;
 
   initializeOpenGLFunctions();
 
@@ -47,6 +47,7 @@ GstQSGTexture::GstQSGTexture ()
 
   gst_video_info_init (&this->v_info);
   this->buffer_ = NULL;
+  this->buffer_was_bound = FALSE;
   this->qt_context_ = NULL;
   this->sync_buffer_ = gst_buffer_new ();
   this->dummy_tex_id_ = 0;
@@ -56,6 +57,7 @@ GstQSGTexture::~GstQSGTexture ()
 {
   gst_buffer_replace (&this->buffer_, NULL);
   gst_buffer_replace (&this->sync_buffer_, NULL);
+  this->buffer_was_bound = FALSE;
   if (this->dummy_tex_id_ && QOpenGLContext::currentContext ()) {
     QOpenGLContext::currentContext ()->functions ()->glDeleteTextures (1,
         &this->dummy_tex_id_);
@@ -80,9 +82,24 @@ GstQSGTexture::setBuffer (GstBuffer * buffer)
   if (!gst_buffer_replace (&this->buffer_, buffer))
     return FALSE;
 
+  this->buffer_was_bound = FALSE;
   this->qt_context_ = gst_gl_context_get_current ();
 
   return TRUE;
+}
+
+/* only called from the streaming thread with scene graph thread blocked */
+GstBuffer *
+GstQSGTexture::getBuffer (gboolean * was_bound)
+{
+  GstBuffer *buffer = NULL;
+
+  if (this->buffer_)
+    buffer = gst_buffer_ref (this->buffer_);
+  if (was_bound)
+    *was_bound = this->buffer_was_bound;
+
+  return buffer;
 }
 
 /* only called from qt's scene graph render thread */
@@ -97,9 +114,7 @@ GstQSGTexture::bind ()
   gboolean use_dummy_tex = TRUE;
 
   if (!this->qt_context_)
-    return;
-
-  gst_gl_context_activate (this->qt_context_, TRUE);
+    goto out;
 
   if (!this->buffer_)
     goto out;
@@ -144,6 +159,8 @@ GstQSGTexture::bind ()
    * to use the dummy texture */
   use_dummy_tex = FALSE;
 
+  this->buffer_was_bound = TRUE;
+
 out:
   if (G_UNLIKELY (use_dummy_tex)) {
     QOpenGLContext *qglcontext = QOpenGLContext::currentContext ();
@@ -173,9 +190,8 @@ out:
     g_assert (this->dummy_tex_id_ != 0);
 
     funcs->glBindTexture (GL_TEXTURE_2D, this->dummy_tex_id_);
+    GST_LOG ("%p binding fallback dummy Qt texture %u", this, this->dummy_tex_id_);
   }
-
-  gst_gl_context_activate (this->qt_context_, FALSE);
 }
 
 /* can be called from any thread */

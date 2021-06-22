@@ -167,7 +167,21 @@ struct _GstRTSPStream {
   gchar *stream_id;
 
   GstStructure     *rtx_pt_map;
+
+  guint32       segment_seqnum[2];
 };
+
+/**
+ * GstRTSPSrcTimeoutCause:
+ * @GST_RTSP_SRC_TIMEOUT_CAUSE_RTCP: timeout triggered by RTCP
+ *
+ * Different causes to why the rtspsrc generated the GstRTSPSrcTimeout
+ * message.
+ */
+typedef enum
+{
+  GST_RTSP_SRC_TIMEOUT_CAUSE_RTCP
+} GstRTSPSrcTimeoutCause;
 
 /**
  * GstRTSPNatMethod:
@@ -182,6 +196,7 @@ typedef enum
   GST_RTSP_NAT_DUMMY
 } GstRTSPNatMethod;
 
+
 struct _GstRTSPSrc {
   GstBin           parent;
 
@@ -192,14 +207,18 @@ struct _GstRTSPSrc {
   GstSegment       segment;
   gboolean         running;
   gboolean         need_range;
-  gboolean         skip;
+  gboolean         server_side_trickmode;
+  GstClockTime     trickmode_interval;
   gint             free_channel;
   gboolean         need_segment;
+  gboolean         clip_out_segment;
+  GstSegment       out_segment;
   GstClockTime     base_time;
 
   /* UDP mode loop */
   gint             pending_cmd;
   gint             busy_cmd;
+  GCond            cmd_cond;
   gboolean         ignore_timeout;
   gboolean         open_error;
 
@@ -217,8 +236,7 @@ struct _GstRTSPSrc {
   gboolean          debug;
   guint             retry;
   guint64           udp_timeout;
-  GTimeVal          tcp_timeout;
-  GTimeVal         *ptcp_timeout;
+  gint64            tcp_timeout;
   guint             latency;
   gboolean          drop_on_latency;
   guint64           connection_speed;
@@ -250,12 +268,16 @@ struct _GstRTSPSrc {
   gboolean          do_retransmission;
   gint              ntp_time_source;
   gchar            *user_agent;
-  GstClockTime      max_rtcp_rtp_time_diff;
+  gint              max_rtcp_rtp_time_diff;
   gboolean          rfc7273_sync;
   guint64           max_ts_offset_adjustment;
   gint64            max_ts_offset;
   gboolean          max_ts_offset_is_set;
   gint              backchannel;
+  GstClockTime      teardown_timeout;
+  gboolean          onvif_mode;
+  gboolean          onvif_rate_control;
+  gboolean          is_live;
 
   /* state */
   GstRTSPState       state;
@@ -281,6 +303,7 @@ struct _GstRTSPSrc {
    * between any two random access points
    *  */
   gfloat             seekable;
+  guint32            seek_seqnum;
   GstClockTime       last_pos;
 
   /* session management */
@@ -291,16 +314,28 @@ struct _GstRTSPSrc {
 
   GstRTSPConnInfo  conninfo;
 
+  /* SET/GET PARAMETER requests queue */
+  GQueue set_get_param_q;
+
   /* a list of RTSP extensions as GstElement */
   GstRTSPExtensionList  *extensions;
 
   GstRTSPVersion default_version;
   GstRTSPVersion version;
+
+  GstEvent *initial_seek;
+
+  guint group_id;
+  GMutex group_lock;
 };
 
 struct _GstRTSPSrcClass {
   GstBinClass parent_class;
 
+ /* action signals */
+  gboolean (*get_parameter) (GstRTSPSrc *rtsp, const gchar *parameter, const gchar *content_type, GstPromise *promise);
+  gboolean (*get_parameters) (GstRTSPSrc *rtsp, gchar **parameters, const gchar *content_type, GstPromise *promise);
+  gboolean (*set_parameter) (GstRTSPSrc *rtsp, const gchar *name, const gchar *value, const gchar *content_type, GstPromise *promise);
   GstFlowReturn (*push_backchannel_buffer) (GstRTSPSrc *src, guint id, GstSample *sample);
 };
 

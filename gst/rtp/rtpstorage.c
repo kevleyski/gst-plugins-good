@@ -23,6 +23,8 @@
 #include "rtpstorage.h"
 #include "rtpstoragestream.h"
 
+#define GST_CAT_DEFAULT (gst_rtp_storage_debug)
+
 enum
 {
   SIGNAL_PACKET_RECOVERED,
@@ -65,8 +67,7 @@ rtp_storage_class_init (RtpStorageClass * klass)
 
   rtp_storage_signals[SIGNAL_PACKET_RECOVERED] =
       g_signal_new ("packet-recovered", G_TYPE_FROM_CLASS (klass),
-      G_SIGNAL_RUN_LAST, 0, NULL, NULL,
-      g_cclosure_marshal_generic, G_TYPE_NONE, 1, GST_TYPE_BUFFER);
+      G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_BUFFER);
 
   gobject_class->dispose = rtp_storage_dispose;
 }
@@ -78,18 +79,29 @@ rtp_storage_get_packets_for_recovery (RtpStorage * self, gint fec_pt,
   GstBufferList *ret = NULL;
   RtpStorageStream *stream;
 
+  if (0 == self->size_time) {
+    GST_WARNING_OBJECT (self, "Received request for recovery RTP packets"
+        " around lost_seqnum=%u fec_pt=%u for ssrc=%08x, but size is 0",
+        lost_seq, fec_pt, ssrc);
+    return NULL;
+  }
+
   STORAGE_LOCK (self);
   stream = g_hash_table_lookup (self->streams, GUINT_TO_POINTER (ssrc));
   STORAGE_UNLOCK (self);
 
   if (NULL == stream) {
-    GST_ERROR_OBJECT (self, "Cant find ssrc = 0x%x", ssrc);
+    GST_ERROR_OBJECT (self, "Can't find ssrc = 0x08%x", ssrc);
   } else {
     STREAM_LOCK (stream);
     if (stream->queue.length > 0) {
+      GST_LOG_OBJECT (self, "Looking for recovery packets for fec_pt=%u around"
+          " lost_seq=%u for ssrc=%08x", fec_pt, lost_seq, ssrc);
       ret =
           rtp_storage_stream_get_packets_for_recovery (stream, fec_pt,
           lost_seq);
+    } else {
+      GST_DEBUG_OBJECT (self, "Empty RTP storage for ssrc=%08x", ssrc);
     }
     STREAM_UNLOCK (stream);
   }
@@ -104,16 +116,24 @@ rtp_storage_get_redundant_packet (RtpStorage * self, guint32 ssrc,
   GstBuffer *ret = NULL;
   RtpStorageStream *stream;
 
+  if (0 == self->size_time) {
+    GST_WARNING_OBJECT (self, "Received request for redundant RTP packet with"
+        " seq=%u for ssrc=%08x, but size is 0", lost_seq, ssrc);
+    return NULL;
+  }
+
   STORAGE_LOCK (self);
   stream = g_hash_table_lookup (self->streams, GUINT_TO_POINTER (ssrc));
   STORAGE_UNLOCK (self);
 
   if (NULL == stream) {
-    GST_ERROR_OBJECT (self, "Cant find ssrc = 0x%x", ssrc);
+    GST_ERROR_OBJECT (self, "Can't find ssrc = 0x%x", ssrc);
   } else {
     STREAM_LOCK (stream);
     if (stream->queue.length > 0) {
       ret = rtp_storage_stream_get_redundant_packet (stream, lost_seq);
+    } else {
+      GST_DEBUG_OBJECT (self, "Empty RTP storage for ssrc=%08x", ssrc);
     }
     STREAM_UNLOCK (stream);
   }
@@ -132,6 +152,10 @@ rtp_storage_do_put_recovered_packet (RtpStorage * self,
   STORAGE_UNLOCK (self);
 
   g_assert (stream);
+
+  GST_LOG_OBJECT (self,
+      "Storing recovered RTP packet with ssrc=%08x pt=%u seq=%u %"
+      GST_PTR_FORMAT, ssrc, pt, seq, buffer);
 
   STREAM_LOCK (stream);
   rtp_storage_stream_add_item (stream, buffer, pt, seq);
@@ -183,6 +207,10 @@ rtp_storage_append_buffer (RtpStorage * self, GstBuffer * buf)
   }
 
   STORAGE_UNLOCK (self);
+
+  GST_LOG_OBJECT (self,
+      "Storing RTP packet with ssrc=%08x pt=%u seq=%u %" GST_PTR_FORMAT,
+      ssrc, pt, seq, buf);
 
   STREAM_LOCK (stream);
 

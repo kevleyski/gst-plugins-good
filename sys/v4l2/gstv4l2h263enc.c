@@ -88,7 +88,7 @@ gst_v4l2_h263_enc_class_init (GstV4l2H263EncClass * klass)
 
   gst_element_class_set_static_metadata (element_class,
       "V4L2 H.263 Encoder",
-      "Codec/Encoder/Video",
+      "Codec/Encoder/Video/Hardware",
       "Encode H.263 video streams via V4L2 API",
       "Nicolas Dufresne <nicolas.dufresne@collabora.com>");
 
@@ -111,6 +111,6 @@ gst_v4l2_h263_enc_register (GstPlugin * plugin, const gchar * basename,
     const gchar * device_path, GstCaps * sink_caps, GstCaps * src_caps)
 {
   gst_v4l2_video_enc_register (plugin, GST_TYPE_V4L2_H263_ENC,
-      "h263", basename, device_path, sink_caps,
+      "h263", basename, device_path, NULL, -1, sink_caps,
       gst_static_caps_get (&src_template_caps), src_caps);
 }

@@ -1,10 +1,11 @@
 jpeg_sources = [
   'gstjpeg.c',
+  'gstjpegplugin.c',
   'gstjpegenc.c',
   'gstjpegdec.c',
 ]
 
-jpeglib = cc.find_library('jpeg', required : false)
+jpeglib = dependency('libjpeg', required : get_option('jpeg'))
 
 if jpeglib.found()
   gstjpeg = library('gstjpeg',
@@ -17,4 +18,5 @@ if jpeglib.found()
     install_dir : plugins_install_dir,
   )
   pkgconfig.generate(gstjpeg, install_dir : plugins_pkgconfig_install_dir)
+  plugins += [gstjpeg]
 endif

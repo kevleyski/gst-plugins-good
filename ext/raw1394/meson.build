@@ -1,6 +1,6 @@
-raw1394_dep = dependency('libraw1394', version: '>= 2.0.0', required: false)
-avc1394_dep = dependency('libavc1394', version: '>= 0.5.4', required: false)
-iec61883_dep = dependency('libiec61883', version: '>= 1.0.0', required: false)
+raw1394_dep = dependency('libraw1394', version: '>= 2.0.0', required: get_option('dv1394'))
+avc1394_dep = dependency('libavc1394', version: '>= 0.5.4', required: get_option('dv1394'))
+iec61883_dep = dependency('libiec61883', version: '>= 1.0.0', required: get_option('dv1394'))
 
 have_1394 = false
 if raw1394_dep.found() and iec61883_dep.found() and avc1394_dep.found()
@@ -12,11 +12,11 @@ if raw1394_dep.found() and iec61883_dep.found() and avc1394_dep.found()
 endif
 
 if have_1394
-  library('gst1394',
+  plugins += [library('gst1394',
     'gst1394.c', 'gst1394probe.c', 'gstdv1394src.c', 'gsthdv1394src.c', 'gst1394clock.c',
     c_args : gst_plugins_good_args + ['-DHAVE_LIBIEC61883'],
     include_directories : [configinc, libsinc],
     dependencies : [gstvideo_dep, gstbase_dep, raw1394_dep, avc1394_dep, iec61883_dep],
     install : true,
-    install_dir : plugins_install_dir)
+    install_dir : plugins_install_dir)]
 endif

@@ -27,13 +27,13 @@
 
 /**
  * SECTION:element-rtpmux
+ * @title: rtpmux
  * @see_also: rtpdtmfmux
  *
  * The rtp muxer takes multiple RTP streams having the same clock-rate and
  * muxes into a single stream with a single SSRC.
  *
- * <refsect2>
- * <title>Example pipelines</title>
+ * ## Example pipelines
  * |[
  * gst-launch-1.0 rtpmux name=mux ! udpsink host=127.0.0.1 port=8888        \
  *              alsasrc ! alawenc ! rtppcmapay !                        \
@@ -45,7 +45,7 @@
  * In this example, an audio stream is captured from ALSA and another is
  * generated, both are encoded into different payload types and muxed together
  * so they can be sent on the same port.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -112,8 +112,9 @@ static void gst_rtp_mux_dispose (GObject * object);
 static gboolean gst_rtp_mux_src_event_real (GstRTPMux * rtp_mux,
     GstEvent * event);
 
-G_DEFINE_TYPE (GstRTPMux, gst_rtp_mux, GST_TYPE_ELEMENT);
-
+G_DEFINE_TYPE_WITH_CODE (GstRTPMux, gst_rtp_mux, GST_TYPE_ELEMENT,
+    GST_DEBUG_CATEGORY_INIT (gst_rtp_mux_debug, "rtpmux", 0, "rtp muxer"));
+GST_ELEMENT_REGISTER_DEFINE (rtpmux, "rtpmux", GST_RANK_NONE, GST_TYPE_RTP_MUX);
 
 static void
 gst_rtp_mux_class_init (GstRTPMuxClass * klass)
@@ -213,7 +214,7 @@ gst_rtp_mux_src_event_real (GstRTPMux * rtp_mux, GstEvent * event)
         if (!gst_structure_get_uint (s, "ssrc", &ssrc))
           ssrc = -1;
 
-        GST_DEBUG_OBJECT (rtp_mux, "collided ssrc: %" G_GUINT32_FORMAT, ssrc);
+        GST_DEBUG_OBJECT (rtp_mux, "collided ssrc: %x", ssrc);
 
         /* choose another ssrc for our stream */
         GST_OBJECT_LOCK (rtp_mux);
@@ -229,6 +230,8 @@ gst_rtp_mux_src_event_real (GstRTPMux * rtp_mux, GstEvent * event)
             rtp_mux->current_ssrc = g_random_int ();
 
           new_ssrc = rtp_mux->current_ssrc;
+          GST_INFO_OBJECT (rtp_mux, "New ssrc after collision %x (was: %x)",
+              new_ssrc, ssrc);
           GST_OBJECT_UNLOCK (rtp_mux);
 
           caps = gst_pad_get_current_caps (rtp_mux->srcpad);
@@ -265,7 +268,6 @@ gst_rtp_mux_init (GstRTPMux * rtp_mux)
 
   rtp_mux->ssrc = DEFAULT_SSRC;
   rtp_mux->current_ssrc = DEFAULT_SSRC;
-  rtp_mux->ssrc_random = TRUE;
   rtp_mux->ts_offset = DEFAULT_TIMESTAMP_OFFSET;
   rtp_mux->seqnum_offset = DEFAULT_SEQNUM_OFFSET;
 
@@ -372,9 +374,9 @@ process_buffer_locked (GstRTPMux * rtp_mux, GstRTPMuxPadPrivate * padpriv,
   gst_rtp_buffer_set_ssrc (rtpbuffer, rtp_mux->current_ssrc);
   gst_rtp_mux_readjust_rtp_timestamp_locked (rtp_mux, padpriv, rtpbuffer);
   GST_LOG_OBJECT (rtp_mux,
-      "Pushing packet size %" G_GSIZE_FORMAT ", seq=%d, ts=%u",
+      "Pushing packet size %" G_GSIZE_FORMAT ", seq=%d, ts=%u, ssrc=%x",
       rtpbuffer->map[0].size, rtp_mux->seqnum,
-      gst_rtp_buffer_get_timestamp (rtpbuffer));
+      gst_rtp_buffer_get_timestamp (rtpbuffer), rtp_mux->current_ssrc);
 
   if (padpriv) {
     if (padpriv->segment.format == GST_FORMAT_TIME) {
@@ -603,6 +605,9 @@ gst_rtp_mux_setcaps (GstPad * pad, GstRTPMux * rtp_mux, GstCaps * caps)
   GstRTPMuxPadPrivate *padpriv;
   GstCaps *peercaps;
 
+  if (caps == NULL)
+    return FALSE;
+
   if (!gst_caps_is_fixed (caps))
     return FALSE;
 
@@ -617,9 +622,13 @@ gst_rtp_mux_setcaps (GstPad * pad, GstRTPMux * rtp_mux, GstCaps * caps)
       structure = gst_caps_get_structure (othercaps, 0);
       GST_OBJECT_LOCK (rtp_mux);
       if (gst_structure_get_uint (structure, "ssrc", &rtp_mux->current_ssrc)) {
-        GST_DEBUG_OBJECT (pad, "Use downstream ssrc: %x",
-            rtp_mux->current_ssrc);
+        GST_INFO_OBJECT (pad, "Use downstream ssrc: %x", rtp_mux->current_ssrc);
         rtp_mux->have_ssrc = TRUE;
+      }
+      if (gst_structure_get_uint (structure,
+              "timestamp-offset", &rtp_mux->ts_base)) {
+        GST_INFO_OBJECT (pad, "Use downstream timestamp-offset: %u",
+            rtp_mux->ts_base);
       }
       GST_OBJECT_UNLOCK (rtp_mux);
     }
@@ -647,12 +656,16 @@ gst_rtp_mux_setcaps (GstPad * pad, GstRTPMux * rtp_mux, GstCaps * caps)
 
   /* if we don't have a specified ssrc, first try to take one from the caps,
      and if that fails, generate one */
-  if (!rtp_mux->have_ssrc) {
-    if (rtp_mux->ssrc_random) {
-      if (!gst_structure_get_uint (structure, "ssrc", &rtp_mux->current_ssrc))
+  if (rtp_mux->ssrc == DEFAULT_SSRC) {
+    if (rtp_mux->current_ssrc == DEFAULT_SSRC) {
+      if (!gst_structure_get_uint (structure, "ssrc", &rtp_mux->current_ssrc)) {
         rtp_mux->current_ssrc = g_random_int ();
-      rtp_mux->have_ssrc = TRUE;
+        GST_INFO_OBJECT (rtp_mux, "Set random ssrc %x", rtp_mux->current_ssrc);
+      }
     }
+  } else {
+    rtp_mux->current_ssrc = rtp_mux->ssrc;
+    GST_INFO_OBJECT (rtp_mux, "Set ssrc %x", rtp_mux->current_ssrc);
   }
 
   gst_caps_set_simple (caps,
@@ -738,6 +751,7 @@ gst_rtp_mux_getcaps (GstPad * pad, GstRTPMux * mux, GstCaps * filter)
   GstCaps *peercaps;
   GstCaps *othercaps;
   GstCaps *tcaps;
+  const GstStructure *structure;
 
   peercaps = gst_pad_peer_query_caps (mux->srcpad, NULL);
 
@@ -758,6 +772,12 @@ gst_rtp_mux_getcaps (GstPad * pad, GstRTPMux * mux, GstCaps * filter)
 
   GST_LOG_OBJECT (pad, "Intersected srcpad-peercaps and template caps: %"
       GST_PTR_FORMAT, othercaps);
+
+  structure = gst_caps_get_structure (othercaps, 0);
+  if (mux->ssrc == DEFAULT_SSRC) {
+    if (gst_structure_get_uint (structure, "ssrc", &mux->current_ssrc))
+      GST_DEBUG_OBJECT (pad, "Use downstream ssrc: %x", mux->current_ssrc);
+  }
 
   clear_caps (othercaps, TRUE);
 
@@ -864,7 +884,7 @@ gst_rtp_mux_set_property (GObject * object,
       rtp_mux->ssrc = g_value_get_uint (value);
       rtp_mux->current_ssrc = rtp_mux->ssrc;
       rtp_mux->have_ssrc = TRUE;
-      rtp_mux->ssrc_random = FALSE;
+      GST_DEBUG_OBJECT (rtp_mux, "ssrc prop set to %x", rtp_mux->ssrc);
       GST_OBJECT_UNLOCK (rtp_mux);
       break;
     default:
@@ -957,12 +977,8 @@ gst_rtp_mux_ready_to_paused (GstRTPMux * rtp_mux)
 
   rtp_mux->last_stop = GST_CLOCK_TIME_NONE;
 
-  if (rtp_mux->ssrc_random) {
-    rtp_mux->have_ssrc = FALSE;
-  } else {
+  if (rtp_mux->have_ssrc)
     rtp_mux->current_ssrc = rtp_mux->ssrc;
-    rtp_mux->have_ssrc = TRUE;
-  }
 
   GST_DEBUG_OBJECT (rtp_mux, "set timestamp-offset to %u", rtp_mux->ts_base);
 
@@ -997,13 +1013,4 @@ gst_rtp_mux_change_state (GstElement * element, GstStateChange transition)
   }
 
   return ret;
-}
-
-gboolean
-gst_rtp_mux_plugin_init (GstPlugin * plugin)
-{
-  GST_DEBUG_CATEGORY_INIT (gst_rtp_mux_debug, "rtpmux", 0, "rtp muxer");
-
-  return gst_element_register (plugin, "rtpmux", GST_RANK_NONE,
-      GST_TYPE_RTP_MUX);
 }

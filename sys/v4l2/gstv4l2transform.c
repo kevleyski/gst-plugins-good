@@ -47,7 +47,8 @@ GST_DEBUG_CATEGORY_STATIC (gst_v4l2_transform_debug);
 enum
 {
   PROP_0,
-  V4L2_STD_OBJECT_PROPS
+  V4L2_STD_OBJECT_PROPS,
+  PROP_DISABLE_PASSTHROUGH
 };
 
 typedef struct
@@ -68,13 +69,12 @@ gst_v4l2_transform_set_property (GObject * object,
   GstV4l2Transform *self = GST_V4L2_TRANSFORM (object);
 
   switch (prop_id) {
-    case PROP_OUTPUT_IO_MODE:
-      gst_v4l2_object_set_property_helper (self->v4l2output, prop_id, value,
-          pspec);
-      break;
     case PROP_CAPTURE_IO_MODE:
       gst_v4l2_object_set_property_helper (self->v4l2capture, prop_id, value,
           pspec);
+      break;
+    case PROP_DISABLE_PASSTHROUGH:
+      self->disable_passthrough = g_value_get_boolean (value);
       break;
 
       /* By default, only set on output */
@@ -94,13 +94,12 @@ gst_v4l2_transform_get_property (GObject * object,
   GstV4l2Transform *self = GST_V4L2_TRANSFORM (object);
 
   switch (prop_id) {
-    case PROP_OUTPUT_IO_MODE:
-      gst_v4l2_object_get_property_helper (self->v4l2output, prop_id, value,
-          pspec);
-      break;
     case PROP_CAPTURE_IO_MODE:
       gst_v4l2_object_get_property_helper (self->v4l2capture, prop_id, value,
           pspec);
+      break;
+    case PROP_DISABLE_PASSTHROUGH:
+      g_value_set_boolean (value, self->disable_passthrough);
       break;
 
       /* By default read from output */
@@ -116,9 +115,11 @@ gst_v4l2_transform_get_property (GObject * object,
 static gboolean
 gst_v4l2_transform_open (GstV4l2Transform * self)
 {
+  GstV4l2Error error = GST_V4L2_ERROR_INIT;
+
   GST_DEBUG_OBJECT (self, "Opening");
 
-  if (!gst_v4l2_object_open (self->v4l2output))
+  if (!gst_v4l2_object_open (self->v4l2output, &error))
     goto failure;
 
   if (!gst_v4l2_object_open_shared (self->v4l2capture, self->v4l2output))
@@ -161,6 +162,8 @@ failure:
   gst_caps_replace (&self->probed_srccaps, NULL);
   gst_caps_replace (&self->probed_sinkcaps, NULL);
 
+  gst_v4l2_error (self, &error);
+
   return FALSE;
 }
 
@@ -197,6 +200,9 @@ gst_v4l2_transform_set_caps (GstBaseTransform * trans, GstCaps * incaps,
 {
   GstV4l2Error error = GST_V4L2_ERROR_INIT;
   GstV4l2Transform *self = GST_V4L2_TRANSFORM (trans);
+
+  if (self->disable_passthrough)
+    gst_base_transform_set_passthrough (trans, FALSE);
 
   if (self->incaps && self->outcaps) {
     if (gst_caps_is_equal (incaps, self->incaps) &&
@@ -752,7 +758,7 @@ gst_v4l2_transform_fixate_caps (GstBaseTransform * trans,
         goto done;
       }
 
-      /* If all this failed, keep the height that was nearest to the orignal
+      /* If all this failed, keep the height that was nearest to the original
        * height and the nearest possible width. This changes the DAR but
        * there's not much else to do here.
        */
@@ -891,8 +897,24 @@ gst_v4l2_transform_prepare_output_buffer (GstBaseTransform * trans,
   /* Ensure input internal pool is active */
   if (!gst_buffer_pool_is_active (pool)) {
     GstStructure *config = gst_buffer_pool_get_config (pool);
-    gint min = self->v4l2output->min_buffers == 0 ? GST_V4L2_MIN_BUFFERS :
-        self->v4l2output->min_buffers;
+    gint min = MAX (GST_V4L2_MIN_BUFFERS (self->v4l2output),
+        self->v4l2output->min_buffers);
+
+    if (self->v4l2output->mode == GST_V4L2_IO_USERPTR ||
+        self->v4l2output->mode == GST_V4L2_IO_DMABUF_IMPORT) {
+      if (!gst_v4l2_object_try_import (self->v4l2output, inbuf)) {
+        GST_ERROR_OBJECT (self, "cannot import buffers from upstream");
+        return GST_FLOW_ERROR;
+      }
+
+      if (self->v4l2output->need_video_meta) {
+        /* We may need video meta if imported buffer is using non-standard
+         * stride/padding */
+        gst_buffer_pool_config_add_option (config,
+            GST_BUFFER_POOL_OPTION_VIDEO_META);
+      }
+    }
+
     gst_buffer_pool_config_set_params (config, self->incaps,
         self->v4l2output->info.size, min, min);
 
@@ -905,7 +927,8 @@ gst_v4l2_transform_prepare_output_buffer (GstBaseTransform * trans,
   }
 
   GST_DEBUG_OBJECT (self, "Queue input buffer");
-  ret = gst_v4l2_buffer_pool_process (GST_V4L2_BUFFER_POOL (pool), &inbuf);
+  ret =
+      gst_v4l2_buffer_pool_process (GST_V4L2_BUFFER_POOL (pool), &inbuf, NULL);
   if (G_UNLIKELY (ret != GST_FLOW_OK))
     goto beach;
 
@@ -923,7 +946,9 @@ gst_v4l2_transform_prepare_output_buffer (GstBaseTransform * trans,
       goto alloc_failed;
 
     pool = self->v4l2capture->pool;
-    ret = gst_v4l2_buffer_pool_process (GST_V4L2_BUFFER_POOL (pool), outbuf);
+    ret =
+        gst_v4l2_buffer_pool_process (GST_V4L2_BUFFER_POOL (pool), outbuf,
+        NULL);
 
   } while (ret == GST_V4L2_FLOW_CORRUPTED_BUFFER);
 
@@ -966,12 +991,13 @@ gst_v4l2_transform_sink_event (GstBaseTransform * trans, GstEvent * event)
 {
   GstV4l2Transform *self = GST_V4L2_TRANSFORM (trans);
   gboolean ret;
+  GstEventType type = GST_EVENT_TYPE (event);
 
   /* Nothing to flush in passthrough */
   if (gst_base_transform_is_passthrough (trans))
     return GST_BASE_TRANSFORM_CLASS (parent_class)->sink_event (trans, event);
 
-  switch (GST_EVENT_TYPE (event)) {
+  switch (type) {
     case GST_EVENT_FLUSH_START:
       GST_DEBUG_OBJECT (self, "flush start");
       gst_v4l2_object_unlock (self->v4l2output);
@@ -983,14 +1009,16 @@ gst_v4l2_transform_sink_event (GstBaseTransform * trans, GstEvent * event)
 
   ret = GST_BASE_TRANSFORM_CLASS (parent_class)->sink_event (trans, event);
 
-  switch (GST_EVENT_TYPE (event)) {
+  switch (type) {
     case GST_EVENT_FLUSH_STOP:
       /* Buffer should be back now */
       GST_DEBUG_OBJECT (self, "flush stop");
       gst_v4l2_object_unlock_stop (self->v4l2capture);
       gst_v4l2_object_unlock_stop (self->v4l2output);
-      gst_v4l2_buffer_pool_flush (self->v4l2output->pool);
-      gst_v4l2_buffer_pool_flush (self->v4l2capture->pool);
+      if (self->v4l2output->pool)
+        gst_v4l2_buffer_pool_flush (self->v4l2output->pool);
+      if (self->v4l2capture->pool)
+        gst_v4l2_buffer_pool_flush (self->v4l2capture->pool);
       break;
     default:
       break;
@@ -1133,6 +1161,11 @@ gst_v4l2_transform_class_init (GstV4l2TransformClass * klass)
       GST_DEBUG_FUNCPTR (gst_v4l2_transform_change_state);
 
   gst_v4l2_object_install_m2m_properties_helper (gobject_class);
+
+  g_object_class_install_property (gobject_class, PROP_DISABLE_PASSTHROUGH,
+      g_param_spec_boolean ("disable-passthrough", "Disable Passthrough",
+          "Forces passing buffers through the converter", FALSE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 }
 
 static void
@@ -1144,7 +1177,6 @@ gst_v4l2_transform_subclass_init (gpointer g_class, gpointer data)
 
   klass->default_device = cdata->device;
 
-  /* Note: gst_pad_template_new() take the floating ref from the caps */
   gst_element_class_add_pad_template (element_class,
       gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
           cdata->sink_caps));
@@ -1152,6 +1184,8 @@ gst_v4l2_transform_subclass_init (gpointer g_class, gpointer data)
       gst_pad_template_new ("src", GST_PAD_SRC, GST_PAD_ALWAYS,
           cdata->src_caps));
 
+  gst_caps_unref (cdata->sink_caps);
+  gst_caps_unref (cdata->src_caps);
   g_free (cdata);
 }
 
@@ -1192,7 +1226,10 @@ gst_v4l2_transform_register (GstPlugin * plugin, const gchar * basename,
   type_info.class_data = cdata;
   type_info.instance_init = gst_v4l2_transform_subinstance_init;
 
-  type_name = g_strdup_printf ("v4l2%sconvert", basename);
+  if (g_type_from_name ("v4l2convert") != 0)
+    type_name = g_strdup_printf ("v4l2%sconvert", basename);
+  else
+    type_name = g_strdup ("v4l2convert");
   subtype = g_type_register_static (type, type_name, &type_info, 0);
 
   if (!gst_element_register (plugin, type_name, GST_RANK_NONE, subtype))

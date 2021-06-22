@@ -1,10 +1,9 @@
 subdir('directsound')
 subdir('oss')
 subdir('oss4')
+subdir('osxaudio')
+subdir('osxvideo')
+subdir('rpicamsrc')
 subdir('v4l2')
+subdir('waveform')
 subdir('ximage')
-
-# FIXME: Implement these
-#subdir('osxaudio')
-#subdir('osxvideo')
-#subdir('waveform')

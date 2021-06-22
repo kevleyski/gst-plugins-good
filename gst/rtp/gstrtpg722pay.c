@@ -26,6 +26,7 @@
 #include <gst/audio/audio.h>
 #include <gst/rtp/gstrtpbuffer.h>
 
+#include "gstrtpelements.h"
 #include "gstrtpg722pay.h"
 #include "gstrtpchannels.h"
 
@@ -53,8 +54,7 @@ static GstStaticPadTemplate gst_rtp_g722_pay_src_template =
         "media = (string) \"audio\", "
         "encoding-name = (string) \"G722\", "
         "payload = (int) " GST_RTP_PAYLOAD_DYNAMIC_STRING ", "
-        "encoding-params = (string) 1, "
-        "clock-rate = (int) 8000")
+        "encoding-params = (string) 1, " "clock-rate = (int) 8000")
     );
 
 static gboolean gst_rtp_g722_pay_setcaps (GstRTPBasePayload * basepayload,
@@ -65,6 +65,8 @@ static GstCaps *gst_rtp_g722_pay_getcaps (GstRTPBasePayload * rtppayload,
 #define gst_rtp_g722_pay_parent_class parent_class
 G_DEFINE_TYPE (GstRtpG722Pay, gst_rtp_g722_pay,
     GST_TYPE_RTP_BASE_AUDIO_PAYLOAD);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (rtpg722pay, "rtpg722pay",
+    GST_RANK_SECONDARY, GST_TYPE_RTP_G722_PAY, rtp_element_init (plugin));
 
 static void
 gst_rtp_g722_pay_class_init (GstRtpG722PayClass * klass)
@@ -227,11 +229,4 @@ gst_rtp_g722_pay_getcaps (GstRTPBasePayload * rtppayload, GstPad * pad,
   }
 
   return caps;
-}
-
-gboolean
-gst_rtp_g722_pay_plugin_init (GstPlugin * plugin)
-{
-  return gst_element_register (plugin, "rtpg722pay",
-      GST_RANK_SECONDARY, GST_TYPE_RTP_G722_PAY);
 }

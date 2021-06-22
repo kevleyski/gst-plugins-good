@@ -26,11 +26,13 @@
 #include <math.h>
 
 #include <gst/audio/audio.h>
+#include "gstdvelements.h"
 #include "gstdvdemux.h"
 #include "gstsmptetimecode.h"
 
 /**
  * SECTION:element-dvdemux
+ * @title: dvdemux
  *
  * dvdemux splits raw DV into its audio and video components. The audio will be
  * decoded raw samples and the video will be encoded DV video.
@@ -38,12 +40,11 @@
  * This element can operate in both push and pull mode depending on the
  * capabilities of the upstream peer.
  *
- * <refsect2>
- * <title>Example launch line</title>
+ * ## Example launch line
  * |[
  * gst-launch-1.0 filesrc location=test.dv ! dvdemux name=demux ! queue ! audioconvert ! alsasink demux. ! queue ! dvdec ! xvimagesink
  * ]| This pipeline decodes and renders the raw DV stream to an audio and a videosink.
- * </refsect2>
+ *
  */
 
 /* DV output has two modes, normal and wide. The resolution is the same in both
@@ -77,7 +78,7 @@
  *
  * For its part, GStreamer is concerned with accuracy and preservation of
  * information. This element outputs the 720x576 or 720x480 video that it
- * recieves, noting the proper aspect ratio. This should not be a problem for
+ * receives, noting the proper aspect ratio. This should not be a problem for
  * windowed applications, which can change size to fit the video. Applications
  * with fixed size requirements should decide whether to crop or pad which
  * an element such as videobox can do.
@@ -130,6 +131,8 @@ static GstStaticPadTemplate audio_src_temp = GST_STATIC_PAD_TEMPLATE ("audio",
 
 #define gst_dvdemux_parent_class parent_class
 G_DEFINE_TYPE (GstDVDemux, gst_dvdemux, GST_TYPE_ELEMENT);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (dvdemux, "dvdemux", GST_RANK_PRIMARY,
+    GST_TYPE_DVDEMUX, dv_element_init (plugin));
 
 static void gst_dvdemux_finalize (GObject * object);
 
@@ -1121,7 +1124,7 @@ gst_dvdemux_handle_pull_seek (GstDVDemux * demux, GstPad * pad,
     gst_dvdemux_push_event (demux, new_event);
   }
 
-  /* if successfull seek, we update our real segment and push
+  /* if successful seek, we update our real segment and push
    * out the new segment. */
   if (res) {
     memcpy (&demux->time_segment, &seeksegment, sizeof (GstSegment));
@@ -1149,7 +1152,7 @@ gst_dvdemux_handle_pull_seek (GstDVDemux * demux, GstPad * pad,
     demux->need_segment = FALSE;
   }
 
-  /* and restart the task in case it got paused explicitely or by
+  /* and restart the task in case it got paused explicitly or by
    * the FLUSH_START event we pushed out. */
   gst_pad_start_task (demux->sinkpad, (GstTaskFunction) gst_dvdemux_loop,
       demux->sinkpad, NULL);
@@ -1800,7 +1803,7 @@ gst_dvdemux_loop (GstPad * pad)
         if (!gst_dvdemux_handle_pull_seek (dvdemux, dvdemux->videosrcpad,
                 event)) {
           GST_ELEMENT_WARNING (dvdemux, STREAM, DECODE, (NULL),
-              ("Error perfoming initial seek"));
+              ("Error performing initial seek"));
         }
         gst_event_unref (event);
 

@@ -31,8 +31,8 @@
  * Tags sent by upstream elements will be picked up automatically (and merged
  * according to the merge mode set via the tag setter interface).
  *
- * <refsect2>
- * <title>Example pipelines</title>
+ * ## Example pipelines
+ *
  * |[
  * gst-launch-1.0 -v filesrc location=foo.ogg ! decodebin ! audioconvert ! lame ! id3v2mux ! filesink location=foo.mp3
  * ]| A pipeline that transcodes a file from Ogg/Vorbis to mp3 format with an
@@ -41,13 +41,13 @@
  * |[
  * gst-launch-1.0 -m filesrc location=foo.mp3 ! id3demux ! fakesink silent=TRUE 2&gt; /dev/null | grep taglist
  * ]| Verify that tags have been written.
- * </refsect2>
  */
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
+#include "gsttaglibelements.h"
 #include "gstid3v2mux.h"
 
 #include <string.h>
@@ -78,6 +78,10 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_STATIC_CAPS ("ANY"));
 
 G_DEFINE_TYPE (GstId3v2Mux, gst_id3v2_mux, GST_TYPE_TAG_MUX);
+#define _do_init \
+  taglib_element_init (plugin);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (id3v2mux, "id3v2mux",
+    GST_RANK_NONE, GST_TYPE_ID3V2_MUX, _do_init);
 
 static GstBuffer *gst_id3v2_mux_render_tag (GstTagMux * mux,
     const GstTagList * taglist);
@@ -387,8 +391,15 @@ add_id3v2frame_tag (ID3v2::Tag * id3v2tag, const GstTagList * list,
         GST_DEBUG ("Injecting ID3v2.%u frame %u/%u of length %" G_GSIZE_FORMAT " and type %"
             GST_PTR_FORMAT, version, i, num_tags, map.size, s);
 
+#if TAGLIB_MAJOR_VERSION > 1 || (TAGLIB_MAJOR_VERSION == 1 && TAGLIB_MINOR_VERSION >= 5)
+        ID3v2::Header header;
+        header.setMajorVersion (version);
+        frame = factory->createFrame (ByteVector ((const char *) map.data,
+                map.size), &header);
+#else
         frame = factory->createFrame (ByteVector ((const char *) map.data,
                 map.size), (TagLib::uint) version);
+#endif
         if (frame)
           id3v2tag->addFrame (frame);
 
@@ -582,7 +593,13 @@ add_uri_tag (ID3v2::Tag * id3v2tag, const GstTagList * list,
 
       g_free (data);
 
+#if TAGLIB_MAJOR_VERSION > 1 || (TAGLIB_MAJOR_VERSION == 1 && TAGLIB_MINOR_VERSION >= 5)
+      ID3v2::Header header;
+      header.setMajorVersion (4);
+      frame = factory->createFrame (bytes, &header);
+#else
       frame = factory->createFrame (bytes, (TagLib::uint) 4);
+#endif
       if (frame) {
         id3v2tag->addFrame (frame);
 
@@ -742,7 +759,7 @@ foreach_add_tag (const GstTagList * list, const gchar * tag, gpointer userdata)
   GST_LOG ("Processing tag %s (num=%u)", tag, num_tags);
 
   if (num_tags > 1 && gst_tag_is_fixed (tag)) {
-    GST_WARNING ("Multiple occurences of fixed tag '%s', ignoring some", tag);
+    GST_WARNING ("Multiple occurrences of fixed tag '%s', ignoring some", tag);
     num_tags = 1;
   }
 

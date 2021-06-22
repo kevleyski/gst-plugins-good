@@ -26,6 +26,15 @@
  * Generic Forward Error Correction (FEC) encoder using Uneven Level
  * Protection (ULP) as described in RFC 5109.
  *
+ * It differs from the RFC in one important way, it multiplexes the
+ * FEC packets in the same sequence number as media packets. This is to be
+ * compatible with libwebrtc as using in Google Chrome and with Microsoft
+ * Lync / Skype for Business.
+ *
+ * Be warned that after using this element, it is no longer possible to know if
+ * there is a gap in the media stream based on the sequence numbers as the FEC
+ * packets become interleaved with the media packets.
+ *
  * This element will insert protection packets in any RTP stream, which
  * can then be used on the receiving side to recover lost packets.
  *
@@ -60,10 +69,16 @@
  * When using #GstRtpBin, this element should be inserted through the
  * #GstRtpBin::request-fec-encoder signal.
  *
- * Example programs using this element can be found at
- * <https://github.com/sdroege/gstreamer-rs/blob/master/examples/src/bin/rtpfecserver.rs>
+ * ## Example pipeline
+ *
+ * |[
+ * gst-launch-1.0 videotestsrc ! x264enc ! video/x-h264, profile=baseline ! rtph264pay pt=96 ! rtpulpfecenc percentage=100 pt=122 ! udpsink port=8888
+ * ]| This example will receive a stream with FEC and try to reconstruct the packets.
+ *
+ * Example programs are available at
+ * <https://gitlab.freedesktop.org/gstreamer/gstreamer-rs/blob/master/examples/src/bin/rtpfecserver.rs>
  * and
- * <https://github.com/sdroege/gstreamer-rs/blob/master/examples/src/bin/rtpfecclient.rs>.
+ * <https://gitlab.freedesktop.org/gstreamer/gstreamer-rs/blob/master/examples/src/bin/rtpfecclient.rs>
  *
  * See also: #GstRtpUlpFecDec, #GstRtpBin
  * Since: 1.14
@@ -73,6 +88,7 @@
 #include <gst/rtp/gstrtpbuffer.h>
 #include <string.h>
 
+#include "gstrtpelements.h"
 #include "rtpulpfeccommon.h"
 #include "gstrtpulpfecenc.h"
 
@@ -99,6 +115,8 @@ GST_DEBUG_CATEGORY (gst_rtp_ulpfec_enc_debug);
 #define GST_CAT_DEFAULT (gst_rtp_ulpfec_enc_debug)
 
 G_DEFINE_TYPE (GstRtpUlpFecEnc, gst_rtp_ulpfec_enc, GST_TYPE_ELEMENT);
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (rtpulpfecenc, "rtpulpfecenc",
+    GST_RANK_NONE, GST_TYPE_RTP_ULPFEC_ENC, rtp_element_init (plugin));
 
 enum
 {
@@ -542,7 +560,7 @@ gst_rtp_ulpfec_enc_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
 
   ret = gst_rtp_ulpfec_enc_stream_ctx_process (ctx, buffer);
 
-  /* FIXME: does not work for mulitple ssrcs */
+  /* FIXME: does not work for multiple ssrcs */
   fec->num_packets_protected = ctx->num_packets_protected;
 
   return ret;

@@ -62,6 +62,11 @@ struct _GstRtpRtxSend
   /* orig pt (string) -> rtx pt (uint) */
   GstStructure *rtx_pt_map_structure;
 
+  /* orig pt (uint) -> clock rate (uint) */
+  GHashTable *clock_rate_map;
+  /* orig pt (string) -> clock rate (uint) */
+  GstStructure *clock_rate_map_structure;
+
   /* buffering control properties */
   guint max_size_time;
   guint max_size_packets;
@@ -76,9 +81,9 @@ struct _GstRtpRtxSendClass
   GstElementClass parent_class;
 };
 
-
 GType gst_rtp_rtx_send_get_type (void);
-gboolean gst_rtp_rtx_send_plugin_init (GstPlugin * plugin);
+
+GST_ELEMENT_REGISTER_DECLARE (rtprtxsend);
 
 G_END_DECLS
 #endif /* __GST_RTP_RTX_SEND_H__ */

@@ -14,6 +14,7 @@
 
 /**
  * SECTION:element-souphttpsrc
+ * @title: souphttpsrc
  *
  * This plugin reads data from a remote location specified by a URI.
  * Supported protocols are 'http', 'https'.
@@ -30,11 +31,10 @@
  * If the server is not an Icecast server, it will behave as if the
  * #GstSoupHTTPSrc:iradio-mode property were not set. If it is, souphttpsrc will
  * output data with a media type of application/x-icy, in which case you will
- * need to use the #ICYDemux element as follow-up element to extract the Icecast
+ * need to use the #GstICYDemux element as follow-up element to extract the Icecast
  * metadata and to determine the underlying media type.
  *
- * <refsect2>
- * <title>Example launch line</title>
+ * ## Example launch line
  * |[
  * gst-launch-1.0 -v souphttpsrc location=https://some.server.org/index.html
  *     ! filesink location=/home/joe/server.html
@@ -64,7 +64,7 @@
  * These are used by the mime/multipart demultiplexer to emit timestamps
  * on the JPEG-encoded video frame buffers. This allows the Matroska
  * multiplexer to timestamp the frames in the resulting file.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -78,6 +78,7 @@
 #include <gst/gstelement.h>
 #include <gst/gst-i18n-plugin.h>
 #include <libsoup/soup.h>
+#include "gstsoupelements.h"
 #include "gstsouphttpsrc.h"
 #include "gstsouputils.h"
 
@@ -141,6 +142,7 @@ enum
 #define REDUCE_BLOCKSIZE_LIMIT 0.20
 #define REDUCE_BLOCKSIZE_COUNT 2
 #define REDUCE_BLOCKSIZE_FACTOR 0.5
+#define GROW_TIME_LIMIT (1 * GST_SECOND)
 
 static void gst_soup_http_src_uri_handler_init (gpointer g_iface,
     gpointer iface_data);
@@ -191,6 +193,8 @@ static void gst_soup_http_src_authenticate_cb (SoupSession * session,
 G_DEFINE_TYPE_WITH_CODE (GstSoupHTTPSrc, gst_soup_http_src, GST_TYPE_PUSH_SRC,
     G_IMPLEMENT_INTERFACE (GST_TYPE_URI_HANDLER,
         gst_soup_http_src_uri_handler_init));
+GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (souphttpsrc, "souphttpsrc",
+    GST_RANK_PRIMARY, GST_TYPE_SOUP_HTTP_SRC, soup_element_init (plugin));
 
 static void
 gst_soup_http_src_class_init (GstSoupHTTPSrcClass * klass)
@@ -452,12 +456,15 @@ gst_soup_http_src_reset (GstSoupHTTPSrc * src)
 
   src->reduce_blocksize_count = 0;
   src->increase_blocksize_count = 0;
+  src->last_socket_read_time = 0;
 
   g_cancellable_reset (src->cancellable);
+  g_mutex_lock (&src->mutex);
   if (src->input_stream) {
     g_object_unref (src->input_stream);
     src->input_stream = NULL;
   }
+  g_mutex_unlock (&src->mutex);
 
   gst_caps_replace (&src->src_caps, NULL);
   g_free (src->iradio_name);
@@ -915,6 +922,7 @@ gst_soup_http_src_session_open (GstSoupHTTPSrc * src)
   if (!src->session) {
     GstQuery *query;
     gboolean can_share = (src->timeout == DEFAULT_TIMEOUT)
+        && (src->cookies == NULL)
         && (src->ssl_strict == DEFAULT_SSL_STRICT)
         && (src->tls_interaction == NULL) && (src->proxy == NULL)
         && (src->tls_database == DEFAULT_TLS_DATABASE)
@@ -1168,8 +1176,9 @@ gst_soup_http_src_got_headers (GstSoupHTTPSrc * src, SoupMessage * msg)
   gst_event_unref (http_headers_event);
 
   /* Parse Content-Length. */
-  if (soup_message_headers_get_encoding (msg->response_headers) ==
-      SOUP_ENCODING_CONTENT_LENGTH) {
+  if (SOUP_STATUS_IS_SUCCESSFUL (msg->status_code) &&
+      (soup_message_headers_get_encoding (msg->response_headers) ==
+          SOUP_ENCODING_CONTENT_LENGTH)) {
     newsize = src->request_position +
         soup_message_headers_get_content_length (msg->response_headers);
     if (!src->have_size || (src->content_size != newsize)) {
@@ -1411,7 +1420,8 @@ gst_soup_http_src_parse_status (SoupMessage * msg, GstSoupHTTPSrc * src)
      * a body message, requests that go beyond the content limits will result
      * in an error. Here we convert those to EOS */
     if (msg->status_code == SOUP_STATUS_REQUESTED_RANGE_NOT_SATISFIABLE &&
-        src->have_body && !src->have_size) {
+        src->have_body && (!src->have_size ||
+            (src->request_position >= src->content_size))) {
       GST_DEBUG_OBJECT (src, "Requested range out of limits and received full "
           "body, returning EOS");
       return GST_FLOW_EOS;
@@ -1498,6 +1508,8 @@ gst_soup_http_src_build_message (GstSoupHTTPSrc * src, const gchar * method)
       soup_message_headers_append (src->msg->request_headers, "Cookie",
           *cookie);
     }
+
+    soup_message_disable_feature (src->msg, SOUP_TYPE_COOKIE_JAR);
   }
 
   if (!src->compress)
@@ -1519,6 +1531,7 @@ gst_soup_http_src_build_message (GstSoupHTTPSrc * src, const gchar * method)
   return TRUE;
 }
 
+/* Lock taken */
 static GstFlowReturn
 gst_soup_http_src_send_message (GstSoupHTTPSrc * src)
 {
@@ -1526,9 +1539,13 @@ gst_soup_http_src_send_message (GstSoupHTTPSrc * src)
   GError *error = NULL;
 
   g_return_val_if_fail (src->msg != NULL, GST_FLOW_ERROR);
+  g_assert (src->input_stream == NULL);
 
   src->input_stream =
       soup_session_send (src->session, src->msg, src->cancellable, &error);
+
+  if (error)
+    GST_DEBUG_OBJECT (src, "Sending message failed: %s", error->message);
 
   if (g_cancellable_is_cancelled (src->cancellable)) {
     ret = GST_FLOW_FLUSHING;
@@ -1630,10 +1647,15 @@ gst_soup_http_src_check_update_blocksize (GstSoupHTTPSrc * src,
 {
   guint blocksize = gst_base_src_get_blocksize (GST_BASE_SRC_CAST (src));
 
-  GST_LOG_OBJECT (src, "Checking to update blocksize. Read:%" G_GINT64_FORMAT
-      " blocksize:%u", bytes_read, blocksize);
+  gint64 time_since_last_read =
+      g_get_monotonic_time () * GST_USECOND - src->last_socket_read_time;
 
-  if (bytes_read >= blocksize * GROW_BLOCKSIZE_LIMIT) {
+  GST_LOG_OBJECT (src, "Checking to update blocksize. Read: %" G_GINT64_FORMAT
+      " bytes, blocksize: %u bytes, time since last read: %" GST_TIME_FORMAT,
+      bytes_read, blocksize, GST_TIME_ARGS (time_since_last_read));
+
+  if (bytes_read >= blocksize * GROW_BLOCKSIZE_LIMIT
+      && time_since_last_read <= GROW_TIME_LIMIT) {
     src->reduce_blocksize_count = 0;
     src->increase_blocksize_count++;
 
@@ -1643,7 +1665,8 @@ gst_soup_http_src_check_update_blocksize (GstSoupHTTPSrc * src,
       gst_base_src_set_blocksize (GST_BASE_SRC_CAST (src), blocksize);
       src->increase_blocksize_count = 0;
     }
-  } else if (bytes_read < blocksize * REDUCE_BLOCKSIZE_LIMIT) {
+  } else if (bytes_read < blocksize * REDUCE_BLOCKSIZE_LIMIT
+      || time_since_last_read > GROW_TIME_LIMIT) {
     src->reduce_blocksize_count++;
     src->increase_blocksize_count = 0;
 
@@ -1731,6 +1754,8 @@ gst_soup_http_src_read_buffer (GstSoupHTTPSrc * src, GstBuffer ** outbuf)
     src->retry_count = 0;
 
     gst_soup_http_src_check_update_blocksize (src, read_bytes);
+
+    src->last_socket_read_time = g_get_monotonic_time () * GST_USECOND;
 
     /* If we're at the end of a range request, read again to let libsoup
      * finalize the request. This allows to reuse the connection again later,
@@ -2134,7 +2159,7 @@ gst_soup_http_src_set_proxy (GstSoupHTTPSrc * src, const gchar * uri)
   return (src->proxy != NULL);
 }
 
-static guint
+static GstURIType
 gst_soup_http_src_uri_get_type (GType type)
 {
   return GST_URI_SRC;

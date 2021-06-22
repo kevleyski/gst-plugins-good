@@ -19,18 +19,6 @@
 #ifndef __GST_MPG123_AUDIO_DEC_H__
 #define __GST_MPG123_AUDIO_DEC_H__
 
-/* This is what the visual studio build in mpg123 does before including the
- * original header file. Without this we get syntax errors in the
- * replace_reader function declarations because it doesn't know ssize_t etc.
- * It doesn't realy matter for us if the ssize_t typedef here is correct. */
-#ifdef _MSC_VER
-#include <tchar.h>
-#include <stdlib.h>
-#include <sys/types.h>
-typedef long ssize_t;
-#include <stdint.h>
-#endif
-
 #include <gst/gst.h>
 #include <gst/audio/gstaudiodecoder.h>
 #include <mpg123.h>
@@ -38,16 +26,9 @@ typedef long ssize_t;
 
 G_BEGIN_DECLS
 
-
-typedef struct _GstMpg123AudioDec GstMpg123AudioDec;
-typedef struct _GstMpg123AudioDecClass GstMpg123AudioDecClass;
-
-
-#define GST_TYPE_MPG123_AUDIO_DEC             (gst_mpg123_audio_dec_get_type())
-#define GST_MPG123_AUDIO_DEC(obj)             (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_MPG123_AUDIO_DEC,GstMpg123AudioDec))
-#define GST_MPG123_AUDIO_DEC_CLASS(klass)     (G_TYPE_CHECK_CLASS_CAST((klass), GST_TYPE_MPG123_AUDIO_DEC,GstMpg123AudioDecClass))
-#define GST_IS_MPG123_AUDIO_DEC(obj)          (G_TYPE_CHECK_INSTANCE_TYPE((obj), GST_TYPE_MPG123_AUDIO_DEC))
-#define GST_IS_MPG123_AUDIO_DEC_CLASS(klass)  (G_TYPE_CHECK_CLASS_TYPE((klass), GST_TYPE_MPG123_AUDIO_DEC))
+#define GST_TYPE_MPG123_AUDIO_DEC (gst_mpg123_audio_dec_get_type())
+G_DECLARE_FINAL_TYPE (GstMpg123AudioDec, gst_mpg123_audio_dec,
+    GST, MPG123_AUDIO_DEC, GstAudioDecoder)
 
 struct _GstMpg123AudioDec
 {
@@ -61,13 +42,7 @@ struct _GstMpg123AudioDec
   off_t frame_offset;
 };
 
-
-struct _GstMpg123AudioDecClass
-{
-  GstAudioDecoderClass parent_class;
-};
-
-G_GNUC_INTERNAL GType gst_mpg123_audio_dec_get_type (void);
+GST_ELEMENT_REGISTER_DECLARE (mpg123audiodec);
 
 G_END_DECLS
 

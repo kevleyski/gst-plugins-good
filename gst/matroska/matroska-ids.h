@@ -132,8 +132,10 @@
 #define GST_MATROSKA_ID_VIDEOPIXELCROPLEFT         0x54CC
 #define GST_MATROSKA_ID_VIDEOPIXELCROPRIGHT        0x54DD
 #define GST_MATROSKA_ID_VIDEOFLAGINTERLACED        0x9A
+#define GST_MATROSKA_ID_VIDEOFIELDORDER            0x9D
 /* semi-draft */
 #define GST_MATROSKA_ID_VIDEOSTEREOMODE            0x53B8
+#define GST_MATROSKA_ID_VIDEOALPHAMODE             0x53C0
 #define GST_MATROSKA_ID_VIDEOASPECTRATIOTYPE       0x54B3
 #define GST_MATROSKA_ID_VIDEOCOLOURSPACE           0x2EB524
 /* semi-draft */
@@ -145,6 +147,20 @@
 #define GST_MATROSKA_ID_VIDEORANGE                 0x55B9
 #define GST_MATROSKA_ID_VIDEOTRANSFERCHARACTERISTICS  0x55BA
 #define GST_MATROSKA_ID_VIDEOPRIMARIES             0x55BB
+#define GST_MATROSKA_ID_MAXCLL                     0x55BC
+#define GST_MATROSKA_ID_MAXFALL                    0x55BD
+#define GST_MATROSKA_ID_MASTERINGMETADATA          0x55D0
+/* IDs in the MasteringMetadata */
+#define GST_MATROSKA_ID_PRIMARYRCHROMATICITYX      0x55D1
+#define GST_MATROSKA_ID_PRIMARYRCHROMATICITYY      0x55D2
+#define GST_MATROSKA_ID_PRIMARYGCHROMATICITYX      0x55D3
+#define GST_MATROSKA_ID_PRIMARYGCHROMATICITYY      0x55D4
+#define GST_MATROSKA_ID_PRIMARYBCHROMATICITYX      0x55D5
+#define GST_MATROSKA_ID_PRIMARYBCHROMATICITYY      0x55D6
+#define GST_MATROSKA_ID_WHITEPOINTCHROMATICITYX    0x55D7
+#define GST_MATROSKA_ID_WHITEPOINTCHROMATICITYY    0x55D8
+#define GST_MATROSKA_ID_LUMINANCEMAX               0x55D9
+#define GST_MATROSKA_ID_LUMINANCEMIN               0x55DA
 
 /* IDs in the TrackAudio master */
 #define GST_MATROSKA_ID_AUDIOSAMPLINGFREQ          0xB5
@@ -175,6 +191,9 @@
 #define GST_MATROSKA_ID_CONTENTSIGKEYID            0x47E4
 #define GST_MATROSKA_ID_CONTENTSIGALGO             0x47E5
 #define GST_MATROSKA_ID_CONTENTSIGHASHALGO         0x47E6
+/* Added in WebM spec */
+#define GST_MATROSKA_ID_CONTENTENCAESSETTINGS      0x47E7
+#define GST_MATROSKA_ID_AESSETTINGSCIPHERMODE      0x47E8
 
 /* ID in the CUEs master */
 #define GST_MATROSKA_ID_POINTENTRY                 0xBB
@@ -400,7 +419,7 @@
 #define GST_MATROSKA_CODEC_ID_SUBTITLE_ASCII     "S_TEXT/ASCII"
 #define GST_MATROSKA_CODEC_ID_SUBTITLE_UTF8      "S_TEXT/UTF8"
 #define GST_MATROSKA_CODEC_ID_SUBTITLE_SSA       "S_TEXT/SSA"
-#define GST_MATROSKA_CODEC_ID_SUBTITLE_ASS       "S_TEXT/ASS" 
+#define GST_MATROSKA_CODEC_ID_SUBTITLE_ASS       "S_TEXT/ASS"
 #define GST_MATROSKA_CODEC_ID_SUBTITLE_USF       "S_TEXT/USF"
 #define GST_MATROSKA_CODEC_ID_SUBTITLE_VOBSUB    "S_VOBSUB"
 #define GST_MATROSKA_CODEC_ID_SUBTITLE_HDMVPGS   "S_HDMV/PGS"
@@ -500,8 +519,10 @@ typedef enum {
 } GstMatroskaTrackFlags;
 
 typedef enum {
-  GST_MATROSKA_VIDEOTRACK_INTERLACED = (GST_MATROSKA_TRACK_SHIFT<<0)
-} GstMatroskaVideoTrackFlags;
+  GST_MATROSKA_INTERLACE_MODE_UNKNOWN = 0,
+  GST_MATROSKA_INTERLACE_MODE_INTERLACED = 1,
+  GST_MATROSKA_INTERLACE_MODE_PROGRESSIVE = 2,
+} GstMatroskaInterlaceMode;
 
 typedef enum {
   GST_MATROSKA_STEREO_MODE_SBS_LR      = 0x1,
@@ -513,6 +534,17 @@ typedef enum {
   GST_MATROSKA_STEREO_MODE_FBF_LR      = 0xD,
   GST_MATROSKA_STEREO_MODE_FBF_RL      = 0xE
 } GstMatroskaStereoMode;
+
+typedef enum {
+  GST_MATROSKA_ENCODING_COMPRESSION = 0x00,
+  GST_MATROSKA_ENCODING_ENCRYPTION  = 0x01
+} GstMatroskaEncodingType;
+
+/* WebM spec */
+typedef enum {
+  GST_MATROSKA_BLOCK_ENCRYPTED   = 0x01,
+  GST_MATROSKA_BLOCK_PARTITIONED = 0x02
+} GstMatroskaEncryptedBlockFlags;
 
 typedef struct _GstMatroskaTrackContext GstMatroskaTrackContext;
 
@@ -547,6 +579,11 @@ struct _GstMatroskaTrackContext {
 
   gboolean      set_discont; /* TRUE = set DISCONT flag on next buffer */
 
+  /* Queue to save the GST_PROTECTION events which will be sent before the first source buffer */
+  GQueue         protection_event_queue;
+  /* Protection information structure which will be added in protection metadata for each encrypted buffer */
+  GstStructure * protection_info;
+
   /* Stream header buffer, to put into caps and send before any other buffers */
   GstBufferList * stream_headers;
   gboolean        send_stream_headers;
@@ -579,10 +616,10 @@ struct _GstMatroskaTrackContext {
 
   /* any alignment we need our output buffers to have */
   gint          alignment;
-  
+
   /* for compatibility with VFW files, where timestamp represents DTS */
   gboolean      dts_only;
-  
+
   /* indicate that the track is raw (jpeg,raw variants) and so pts=dts */
   gboolean		intra_only;
 };
@@ -596,14 +633,24 @@ typedef struct _GstMatroskaTrackVideoContext {
   GstMatroskaAspectRatioMode asr_mode;
   guint32       fourcc;
 
+  GstMatroskaInterlaceMode interlace_mode;
+  GstVideoFieldOrder field_order;
+
   GstVideoMultiviewMode multiview_mode;
   GstVideoMultiviewFlags multiview_flags;
+
+  gboolean alpha_mode;
 
   /* QoS */
   GstClockTime  earliest_time;
 
   GstBuffer     *dirac_unit;
   GstVideoColorimetry colorimetry;
+
+  GstVideoMasteringDisplayInfo mastering_display_info;
+  gboolean mastering_display_info_present;
+
+  GstVideoContentLightLevel content_light_level;
 } GstMatroskaTrackVideoContext;
 
 typedef struct _GstMatroskaTrackAudioContext {
@@ -644,11 +691,16 @@ typedef struct _Wavpack4Header {
   guint32 crc;           /* crc for actual decoded data                    */
 } Wavpack4Header;
 
+#define WAVPACK4_HEADER_SIZE (32)
+
 typedef enum {
   GST_MATROSKA_TRACK_ENCODING_SCOPE_FRAME = (1<<0),
   GST_MATROSKA_TRACK_ENCODING_SCOPE_CODEC_DATA = (1<<1),
   GST_MATROSKA_TRACK_ENCODING_SCOPE_NEXT_CONTENT_ENCODING = (1<<2)
 } GstMatroskaTrackEncodingScope;
+
+#define MATROSKA_TRACK_ENCODING_SCOPE_TYPE (matroska_track_encoding_scope_get_type())
+GType matroska_track_encoding_scope_get_type (void);
 
 typedef enum {
   GST_MATROSKA_TRACK_COMPRESSION_ALGORITHM_ZLIB = 0,
@@ -657,6 +709,35 @@ typedef enum {
   GST_MATROSKA_TRACK_COMPRESSION_ALGORITHM_HEADERSTRIP = 3
 } GstMatroskaTrackCompressionAlgorithm;
 
+/* The encryption algorithm used. The value '0' means that the contents
+ * have not been encrypted but only signed.
+ * Predefined values: 1 - DES; 2 - 3DES; 3 - Twofish; 4 - Blowfish; 5 - AES.
+ * WebM only supports a value of 5 (AES).
+ */
+typedef enum {
+  GST_MATROSKA_TRACK_ENCRYPTION_ALGORITHM_NONE     = 0,
+  GST_MATROSKA_TRACK_ENCRYPTION_ALGORITHM_DES      = 1,
+  GST_MATROSKA_TRACK_ENCRYPTION_ALGORITHM_3DES     = 2,
+  GST_MATROSKA_TRACK_ENCRYPTION_ALGORITHM_TWOFISH  = 3,
+  GST_MATROSKA_TRACK_ENCRYPTION_ALGORITHM_BLOWFISH = 4,
+  GST_MATROSKA_TRACK_ENCRYPTION_ALGORITHM_AES      = 5
+} GstMatroskaTrackEncryptionAlgorithm;
+
+#define MATROSKA_TRACK_ENCRYPTION_ALGORITHM_TYPE (matroska_track_encryption_algorithm_get_type())
+GType matroska_track_encryption_algorithm_get_type (void);
+
+/* Defined only in WebM spec.
+ * The cipher mode used in the encryption. Predefined values: 1 - CTR
+ */
+typedef enum {
+  GST_MATROSKA_TRACK_ENCRYPTION_CIPHER_MODE_NONE    = 0,
+  GST_MATROSKA_TRACK_ENCRYPTION_CIPHER_MODE_CTR     = 1
+} GstMatroskaTrackEncryptionCipherMode;
+
+#define MATROSKA_TRACK_ENCRYPTION_CIPHER_MODE_TYPE (matroska_track_encryption_cipher_mode_get_type())
+GType matroska_track_encryption_cipher_mode_get_type (void);
+
+
 typedef struct _GstMatroskaTrackEncoding {
   guint   order;
   guint   scope     : 3;
@@ -664,6 +745,8 @@ typedef struct _GstMatroskaTrackEncoding {
   guint   comp_algo : 2;
   guint8 *comp_settings;
   guint   comp_settings_length;
+  guint   enc_algo  : 3;
+  guint   enc_cipher_mode : 2;
 } GstMatroskaTrackEncoding;
 
 gboolean gst_matroska_track_init_video_context    (GstMatroskaTrackContext ** p_context);

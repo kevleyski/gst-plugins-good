@@ -53,6 +53,8 @@ struct _GstRtpSession {
   GstPad        *send_rtp_src;
   GstPad        *send_rtcp_src;
 
+  guint32        recv_rtcp_segment_seqnum;
+
   GstRtpSessionPrivate *priv;
 };
 
@@ -77,6 +79,8 @@ struct _GstRtpSessionClass {
 };
 
 GType gst_rtp_session_get_type (void);
+
+GST_ELEMENT_REGISTER_DECLARE (rtpsession);
 
 typedef enum {
   GST_RTP_NTP_TIME_SOURCE_NTP,

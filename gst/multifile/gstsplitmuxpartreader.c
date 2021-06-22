@@ -37,13 +37,8 @@ GST_DEBUG_CATEGORY_STATIC (splitmux_part_debug);
 #define SPLITMUX_PART_TYPE_LOCK(p) g_mutex_lock(&(p)->type_lock)
 #define SPLITMUX_PART_TYPE_UNLOCK(p) g_mutex_unlock(&(p)->type_lock)
 
-enum
-{
-  SIGNAL_PREPARED,
-  LAST_SIGNAL
-};
-
-static guint part_reader_signals[LAST_SIGNAL] = { 0 };
+#define SPLITMUX_PART_MSG_LOCK(p) g_mutex_lock(&(p)->msg_lock)
+#define SPLITMUX_PART_MSG_UNLOCK(p) g_mutex_unlock(&(p)->msg_lock)
 
 typedef struct _GstSplitMuxPartPad
 {
@@ -87,6 +82,10 @@ static gboolean splitmux_data_queue_is_full_cb (GstDataQueue * queue,
 static void type_found (GstElement * typefind, guint probability,
     GstCaps * caps, GstSplitMuxPartReader * reader);
 static void check_if_pads_collected (GstSplitMuxPartReader * reader);
+
+static void
+gst_splitmux_part_reader_finish_measuring_streams (GstSplitMuxPartReader *
+    reader);
 
 /* Called with reader lock held */
 static gboolean
@@ -140,7 +139,7 @@ handle_buffer_measuring (GstSplitMuxPartReader * reader,
   if (reader->prep_state == PART_STATE_PREPARING_COLLECT_STREAMS &&
       !part_pad->seen_buffer) {
     /* If this is the first buffer on the pad in the collect_streams state,
-     * then calculate inital offset based on running time of this segment */
+     * then calculate initial offset based on running time of this segment */
     part_pad->initial_ts_offset =
         part_pad->orig_segment.start + part_pad->orig_segment.base -
         part_pad->orig_segment.time;
@@ -153,6 +152,9 @@ handle_buffer_measuring (GstSplitMuxPartReader * reader,
   /* Adjust buffer timestamps */
   offset = reader->start_offset + part_pad->segment.base;
   offset -= part_pad->initial_ts_offset;
+  /* We don't add the ts_offset here, because we
+   * want to measure the logical length of the stream,
+   * not to generate output timestamps */
 
   /* Update the stored max duration on the pad,
    * always preferring making DTS contiguous
@@ -163,8 +165,8 @@ handle_buffer_measuring (GstSplitMuxPartReader * reader,
     ts = GST_BUFFER_PTS (buf) + offset;
 
   GST_DEBUG_OBJECT (reader, "Pad %" GST_PTR_FORMAT
-      " incoming PTS %" GST_TIME_FORMAT
-      " DTS %" GST_TIME_FORMAT " offset by %" GST_STIME_FORMAT
+      " incoming DTS %" GST_TIME_FORMAT
+      " PTS %" GST_TIME_FORMAT " offset by %" GST_STIME_FORMAT
       " to %" GST_STIME_FORMAT, part_pad,
       GST_TIME_ARGS (GST_BUFFER_DTS (buf)),
       GST_TIME_ARGS (GST_BUFFER_PTS (buf)),
@@ -232,6 +234,7 @@ splitmux_part_pad_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   /* Adjust buffer timestamps */
   offset = reader->start_offset + part_pad->segment.base;
   offset -= part_pad->initial_ts_offset;
+  offset += reader->ts_offset;
 
   if (GST_BUFFER_PTS_IS_VALID (buf))
     GST_BUFFER_PTS (buf) += offset;
@@ -360,20 +363,21 @@ splitmux_part_pad_event (GstPad * pad, GstObject * parent, GstEvent * event)
         goto wrong_segment;
 
       /* Adjust segment */
-      /* Adjust start/stop so the overall file is 0 + start_offset based */
+      /* Adjust start/stop so the overall file is 0 + start_offset based,
+       * adding a fixed offset so that DTS is never negative */
       if (seg->stop != -1) {
         seg->stop -= seg->start;
-        seg->stop += seg->time + reader->start_offset;
+        seg->stop += seg->time + reader->start_offset + reader->ts_offset;
       }
-      seg->start = seg->time + reader->start_offset;
+      seg->start = seg->time + reader->start_offset + reader->ts_offset;
       seg->time += reader->start_offset;
       seg->position += reader->start_offset;
-
-      GST_LOG_OBJECT (pad, "Adjusted segment now %" GST_PTR_FORMAT, event);
 
       /* Replace event */
       gst_event_unref (event);
       event = gst_event_new_segment (seg);
+
+      GST_LOG_OBJECT (pad, "Adjusted segment now %" GST_PTR_FORMAT, event);
 
       if (reader->prep_state != PART_STATE_PREPARING_COLLECT_STREAMS
           && reader->prep_state != PART_STATE_PREPARING_MEASURE_STREAMS)
@@ -415,7 +419,10 @@ splitmux_part_pad_event (GstPad * pad, GstObject * parent, GstEvent * event)
           GST_LOG_OBJECT (reader,
               "EOS while measuring streams. Resetting for ready");
           reader->prep_state = PART_STATE_PREPARING_RESET_FOR_READY;
-          SPLITMUX_PART_BROADCAST (reader);
+
+          gst_element_call_async (GST_ELEMENT_CAST (reader),
+              (GstElementCallAsyncFunc)
+              gst_splitmux_part_reader_finish_measuring_streams, NULL, NULL);
         }
         goto drop_event;
       }
@@ -615,10 +622,6 @@ gst_splitmux_part_reader_class_init (GstSplitMuxPartReaderClass * klass)
   gobject_klass->dispose = splitmux_part_reader_dispose;
   gobject_klass->finalize = splitmux_part_reader_finalize;
 
-  part_reader_signals[SIGNAL_PREPARED] =
-      g_signal_new ("prepared", G_TYPE_FROM_CLASS (klass),
-      G_SIGNAL_RUN_FIRST, G_STRUCT_OFFSET (GstSplitMuxPartReaderClass,
-          prepared), NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
   gstelement_class->change_state = gst_splitmux_part_reader_change_state;
   gstelement_class->send_event = gst_splitmux_part_reader_send_event;
 
@@ -636,6 +639,7 @@ gst_splitmux_part_reader_init (GstSplitMuxPartReader * reader)
   g_cond_init (&reader->inactive_cond);
   g_mutex_init (&reader->lock);
   g_mutex_init (&reader->type_lock);
+  g_mutex_init (&reader->msg_lock);
 
   /* FIXME: Create elements on a state change */
   reader->src = gst_element_factory_make ("filesrc", NULL);
@@ -683,10 +687,42 @@ splitmux_part_reader_finalize (GObject * object)
   g_cond_clear (&reader->inactive_cond);
   g_mutex_clear (&reader->lock);
   g_mutex_clear (&reader->type_lock);
+  g_mutex_clear (&reader->msg_lock);
 
   g_free (reader->path);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
+}
+
+static void
+do_async_start (GstSplitMuxPartReader * reader)
+{
+  GstMessage *message;
+
+  SPLITMUX_PART_MSG_LOCK (reader);
+  reader->async_pending = TRUE;
+
+  message = gst_message_new_async_start (GST_OBJECT_CAST (reader));
+  GST_BIN_CLASS (parent_class)->handle_message (GST_BIN_CAST (reader), message);
+  SPLITMUX_PART_MSG_UNLOCK (reader);
+}
+
+static void
+do_async_done (GstSplitMuxPartReader * reader)
+{
+  GstMessage *message;
+
+  SPLITMUX_PART_MSG_LOCK (reader);
+  if (reader->async_pending) {
+    message =
+        gst_message_new_async_done (GST_OBJECT_CAST (reader),
+        GST_CLOCK_TIME_NONE);
+    GST_BIN_CLASS (parent_class)->handle_message (GST_BIN_CAST (reader),
+        message);
+
+    reader->async_pending = FALSE;
+  }
+  SPLITMUX_PART_MSG_UNLOCK (reader);
 }
 
 static void
@@ -850,6 +886,7 @@ gst_splitmux_part_reader_seek_to_segment (GstSplitMuxPartReader * reader,
 static void
 gst_splitmux_part_reader_measure_streams (GstSplitMuxPartReader * reader)
 {
+  SPLITMUX_PART_LOCK (reader);
   /* Trigger a flushing seek to near the end of the file and run each stream
    * to EOS in order to find the smallest end timestamp to start the next
    * file from
@@ -859,18 +896,23 @@ gst_splitmux_part_reader_measure_streams (GstSplitMuxPartReader * reader)
     GstClockTime seek_ts = reader->duration - (0.5 * GST_SECOND);
     gst_splitmux_part_reader_seek_to_time_locked (reader, seek_ts);
   }
+  SPLITMUX_PART_UNLOCK (reader);
+}
 
-  /* Wait for things to happen */
-  while (reader->prep_state == PART_STATE_PREPARING_MEASURE_STREAMS)
-    SPLITMUX_PART_WAIT (reader);
-
+static void
+gst_splitmux_part_reader_finish_measuring_streams (GstSplitMuxPartReader *
+    reader)
+{
+  SPLITMUX_PART_LOCK (reader);
   if (reader->prep_state == PART_STATE_PREPARING_RESET_FOR_READY) {
     /* Fire the prepared signal and go to READY state */
     GST_DEBUG_OBJECT (reader,
-        "Stream measuring complete. File %s is now ready. Firing prepared signal",
-        reader->path);
+        "Stream measuring complete. File %s is now ready", reader->path);
     reader->prep_state = PART_STATE_READY;
-    g_signal_emit (reader, part_reader_signals[SIGNAL_PREPARED], 0, NULL);
+    SPLITMUX_PART_UNLOCK (reader);
+    do_async_done (reader);
+  } else {
+    SPLITMUX_PART_UNLOCK (reader);
   }
 }
 
@@ -939,7 +981,9 @@ check_if_pads_collected (GstSplitMuxPartReader * reader)
       GST_DEBUG_OBJECT (reader,
           "no more pads - file %s. Measuring stream length", reader->path);
       reader->prep_state = PART_STATE_PREPARING_MEASURE_STREAMS;
-      SPLITMUX_PART_BROADCAST (reader);
+      gst_element_call_async (GST_ELEMENT_CAST (reader),
+          (GstElementCallAsyncFunc) gst_splitmux_part_reader_measure_streams,
+          NULL, NULL);
     }
   }
 }
@@ -1041,16 +1085,16 @@ gst_splitmux_part_reader_change_state (GstElement * element,
       break;
     }
     case GST_STATE_CHANGE_READY_TO_PAUSED:{
-      /* Hold the splitmux type lock until after the
-       * parent state change function has finished
-       * changing the states of things, and type finding can continue */
       SPLITMUX_PART_LOCK (reader);
       g_object_set (reader->src, "location", reader->path, NULL);
       reader->prep_state = PART_STATE_PREPARING_COLLECT_STREAMS;
       gst_splitmux_part_reader_set_flushing_locked (reader, FALSE);
       reader->running = TRUE;
       SPLITMUX_PART_UNLOCK (reader);
-      SPLITMUX_PART_TYPE_LOCK (reader);
+
+      /* we go to PAUSED asynchronously once all streams have been collected
+       * and seeks to measure the stream lengths are done */
+      do_async_start (reader);
       break;
     }
     case GST_STATE_CHANGE_READY_TO_NULL:
@@ -1074,33 +1118,16 @@ gst_splitmux_part_reader_change_state (GstElement * element,
 
   ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
   if (ret == GST_STATE_CHANGE_FAILURE) {
-    if (transition == GST_STATE_CHANGE_READY_TO_PAUSED) {
-      /* Make sure to release the lock we took above */
-      SPLITMUX_PART_TYPE_UNLOCK (reader);
-    }
+    do_async_done (reader);
     goto beach;
   }
 
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
-      /* Sleep and wait until all streams have been collected, then do the seeks
-       * to measure the stream lengths. This took the type lock above,
-       * but it's OK to release it now and let typefinding happen... */
-      SPLITMUX_PART_TYPE_UNLOCK (reader);
-
-      SPLITMUX_PART_LOCK (reader);
-
-      while (reader->prep_state == PART_STATE_PREPARING_COLLECT_STREAMS) {
-        GST_LOG_OBJECT (reader, "Waiting to collect all output streams");
-        SPLITMUX_PART_WAIT (reader);
-      }
-
-      if (reader->prep_state == PART_STATE_PREPARING_MEASURE_STREAMS ||
-          reader->prep_state == PART_STATE_PREPARING_RESET_FOR_READY) {
-        gst_splitmux_part_reader_measure_streams (reader);
-      } else if (reader->prep_state == PART_STATE_FAILED)
-        ret = GST_STATE_CHANGE_FAILURE;
-      SPLITMUX_PART_UNLOCK (reader);
+      ret = GST_STATE_CHANGE_ASYNC;
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      do_async_done (reader);
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
       SPLITMUX_PART_LOCK (reader);
@@ -1121,28 +1148,6 @@ beach:
   return ret;
 }
 
-static gboolean
-check_bus_messages (GstSplitMuxPartReader * part)
-{
-  gboolean ret = FALSE;
-  GstBus *bus;
-  GstMessage *m;
-
-  bus = gst_element_get_bus (GST_ELEMENT_CAST (part));
-  while ((m = gst_bus_pop (bus)) != NULL) {
-    if (GST_MESSAGE_TYPE (m) == GST_MESSAGE_ERROR) {
-      GST_LOG_OBJECT (part, "Got error message while preparing. Failing.");
-      gst_message_unref (m);
-      goto done;
-    }
-    gst_message_unref (m);
-  }
-  ret = TRUE;
-done:
-  gst_object_unref (bus);
-  return ret;
-}
-
 gboolean
 gst_splitmux_part_reader_prepare (GstSplitMuxPartReader * part)
 {
@@ -1150,10 +1155,10 @@ gst_splitmux_part_reader_prepare (GstSplitMuxPartReader * part)
 
   ret = gst_element_set_state (GST_ELEMENT_CAST (part), GST_STATE_PAUSED);
 
-  if (ret != GST_STATE_CHANGE_SUCCESS)
+  if (ret == GST_STATE_CHANGE_FAILURE)
     return FALSE;
 
-  return check_bus_messages (part);
+  return TRUE;
 }
 
 void
@@ -1251,12 +1256,13 @@ gst_splitmux_part_reader_get_end_offset (GstSplitMuxPartReader * reader)
 
 void
 gst_splitmux_part_reader_set_start_offset (GstSplitMuxPartReader * reader,
-    GstClockTime offset)
+    GstClockTime time_offset, GstClockTime ts_offset)
 {
   SPLITMUX_PART_LOCK (reader);
-  reader->start_offset = offset;
-  GST_INFO_OBJECT (reader, "TS offset now %" GST_TIME_FORMAT,
-      GST_TIME_ARGS (offset));
+  reader->start_offset = time_offset;
+  reader->ts_offset = ts_offset;
+  GST_INFO_OBJECT (reader, "Time offset now %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (time_offset));
   SPLITMUX_PART_UNLOCK (reader);
 }
 
@@ -1361,6 +1367,7 @@ bus_handler (GstBin * bin, GstMessage * message)
       reader->prep_state = PART_STATE_FAILED;
       SPLITMUX_PART_BROADCAST (reader);
       SPLITMUX_PART_UNLOCK (reader);
+      do_async_done (reader);
       break;
     default:
       break;

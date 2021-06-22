@@ -36,7 +36,7 @@
 #include <QtQuick/QQuickWindow>
 #include <QOpenGLFramebufferObject>
 
-/* compatability definitions... */
+/* compatibility definitions... */
 #ifndef GL_READ_FRAMEBUFFER
 #define GL_READ_FRAMEBUFFER 0x8CA8
 #endif
@@ -103,7 +103,7 @@ QtGLWindow::QtGLWindow ( QWindow * parent, QQuickWindow *src ) :
   QQuickWindow( parent ), source (src)
 {
   QGuiApplication *app = static_cast<QGuiApplication *> (QCoreApplication::instance ());
-  static volatile gsize _debug;
+  static gsize _debug;
 
   g_assert (app != NULL);
 
@@ -117,7 +117,7 @@ QtGLWindow::QtGLWindow ( QWindow * parent, QQuickWindow *src ) :
   g_mutex_init (&this->priv->lock);
   g_cond_init (&this->priv->update_cond);
 
-  this->priv->display = gst_qt_get_gl_display();
+  this->priv->display = gst_qt_get_gl_display(FALSE);
 
   connect (source, SIGNAL(beforeRendering()), this, SLOT(beforeRendering()), Qt::DirectConnection);
   connect (source, SIGNAL(afterRendering()), this, SLOT(afterRendering()), Qt::DirectConnection);
@@ -152,7 +152,7 @@ QtGLWindow::beforeRendering()
 
   g_mutex_lock (&this->priv->lock);
 
-  static volatile gsize once = 0;
+  static gsize once = 0;
   if (g_once_init_enter(&once)) {
     this->priv->start = QDateTime::currentDateTime().toMSecsSinceEpoch();
     g_once_init_leave(&once,1);
@@ -242,14 +242,17 @@ QtGLWindow::afterRendering()
       GST_ERROR ("FBO errors");
       goto errors;
     }
-    gl->ReadBuffer (GL_COLOR_ATTACHMENT0);
+    if (this->priv->useDefaultFbo)
+      gl->ReadBuffer (GL_BACK);
+    else
+      gl->ReadBuffer (GL_COLOR_ATTACHMENT0);
     gl->BlitFramebuffer (0, 0, width, height,
         0, 0, width, height,
         GL_COLOR_BUFFER_BIT, GL_LINEAR);
   } else {
     gl->CopyTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, width, height, 0);
   }
-  
+
   GST_DEBUG ("rendering finished");
 
 errors:
